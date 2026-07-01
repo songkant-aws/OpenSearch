@@ -10,9 +10,15 @@ package org.opensearch.parquet.fields.core.metadata;
 
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.FieldType;
+import org.opensearch.index.engine.dataformat.FieldTypeCapabilities;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.parquet.fields.ParquetField;
 import org.opensearch.parquet.vsr.ManagedVSR;
+
+import java.util.Set;
+
+import static org.opensearch.index.engine.dataformat.FieldTypeCapabilities.Capability.COLUMNAR_STORAGE;
+import static org.opensearch.index.engine.dataformat.FieldTypeCapabilities.Capability.FULL_TEXT_SEARCH;
 
 /**
  * Parquet field for index name.
@@ -33,5 +39,10 @@ public class IndexParquetField extends ParquetField {
     @Override
     public FieldType getFieldType() {
         return null;
+    }
+
+    @Override
+    public Set<FieldTypeCapabilities.Capability> supportedCapabilities() {
+        return Set.of(COLUMNAR_STORAGE, FULL_TEXT_SEARCH);
     }
 }

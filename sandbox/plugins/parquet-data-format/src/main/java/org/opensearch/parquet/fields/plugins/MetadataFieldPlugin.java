@@ -10,9 +10,11 @@ package org.opensearch.parquet.fields.plugins;
 
 import org.opensearch.index.engine.dataformat.FieldTypeCapabilities;
 import org.opensearch.index.mapper.DocCountFieldMapper;
+import org.opensearch.index.mapper.FieldNamesFieldMapper;
 import org.opensearch.index.mapper.IdFieldMapper;
 import org.opensearch.index.mapper.IgnoredFieldMapper;
 import org.opensearch.index.mapper.IndexFieldMapper;
+import org.opensearch.index.mapper.NestedPathFieldMapper;
 import org.opensearch.index.mapper.RoutingFieldMapper;
 import org.opensearch.index.mapper.SeqNoFieldMapper;
 import org.opensearch.index.mapper.SourceFieldMapper;
@@ -31,6 +33,7 @@ import java.util.Map;
 import java.util.Set;
 
 import static org.opensearch.index.engine.dataformat.FieldTypeCapabilities.Capability.COLUMNAR_STORAGE;
+import static org.opensearch.index.engine.dataformat.FieldTypeCapabilities.Capability.FULL_TEXT_SEARCH;
 import static org.opensearch.index.engine.dataformat.FieldTypeCapabilities.Capability.STORED_FIELDS;
 
 /**
@@ -49,6 +52,18 @@ public class MetadataFieldPlugin implements ParquetFieldPlugin {
         fieldMap.put(IndexFieldMapper.CONTENT_TYPE, new IndexParquetField());
         fieldMap.put(RoutingFieldMapper.CONTENT_TYPE, new RoutingParquetField());
         fieldMap.put(IgnoredFieldMapper.CONTENT_TYPE, new IgnoredParquetField());
+        fieldMap.put(FieldNamesFieldMapper.CONTENT_TYPE, new BinaryParquetField() {
+            @Override
+            public Set<FieldTypeCapabilities.Capability> supportedCapabilities() {
+                return Set.of(FULL_TEXT_SEARCH);
+            }
+        });
+        fieldMap.put(NestedPathFieldMapper.NAME, new BinaryParquetField() {
+            @Override
+            public Set<FieldTypeCapabilities.Capability> supportedCapabilities() {
+                return Set.of(FULL_TEXT_SEARCH);
+            }
+        });
         fieldMap.put(IdFieldMapper.CONTENT_TYPE, new IdParquetField());
         fieldMap.put(SeqNoFieldMapper.CONTENT_TYPE, new LongParquetField(false));
         fieldMap.put(SeqNoFieldMapper.PRIMARY_TERM_NAME, new LongParquetField(false));

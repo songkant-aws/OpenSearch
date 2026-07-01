@@ -19,6 +19,11 @@ import org.opensearch.parquet.vsr.ManagedVSR;
 import java.nio.charset.StandardCharsets;
 import java.util.Set;
 
+import static org.opensearch.index.engine.dataformat.FieldTypeCapabilities.Capability.BLOOM_FILTER;
+import static org.opensearch.index.engine.dataformat.FieldTypeCapabilities.Capability.COLUMNAR_STORAGE;
+import static org.opensearch.index.engine.dataformat.FieldTypeCapabilities.Capability.FULL_TEXT_SEARCH;
+import static org.opensearch.index.engine.dataformat.FieldTypeCapabilities.Capability.STORED_FIELDS;
+
 /**
  * Parquet field for _routing metadata stored as UTF-8 using {@link VarCharVector}.
  */
@@ -47,10 +52,6 @@ public class RoutingParquetField extends ParquetField {
 
     @Override
     public Set<FieldTypeCapabilities.Capability> supportedCapabilities() {
-        return Set.of(
-            FieldTypeCapabilities.Capability.COLUMNAR_STORAGE,
-            FieldTypeCapabilities.Capability.BLOOM_FILTER,
-            FieldTypeCapabilities.Capability.STORED_FIELDS
-        );
+        return Set.of(COLUMNAR_STORAGE, BLOOM_FILTER, STORED_FIELDS, FULL_TEXT_SEARCH);
     }
 }

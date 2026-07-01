@@ -60,7 +60,7 @@ start_command() {
   cat <<'CMD'
 ./gradlew run \
   -PnumNodes=1 \
-  -PinstalledPlugins="['arrow-base','composite-engine','parquet-data-format','analytics-engine','analytics-backend-datafusion','test-ppl-frontend']"
+  -PinstalledPlugins="['arrow-base','arrow-flight-rpc','analytics-engine','composite-engine','analytics-backend-lucene','parquet-data-format','analytics-backend-datafusion','test-ppl-frontend']"
 CMD
 }
 
@@ -86,8 +86,8 @@ setup_index() {
     },
     \"mappings\": {
       \"properties\": {
-        \"message\": { \"type\": \"text\" },
-        \"status\": { \"type\": \"keyword\" },
+        \"message\": { \"type\": \"keyword\", \"index\": false },
+        \"status\": { \"type\": \"keyword\", \"index\": false },
         \"value\": { \"type\": \"long\" },
         \"ts\": { \"type\": \"date\" }
       }
@@ -110,7 +110,7 @@ load_sample() {
 
     local i
     for ((i = loaded; i < end; i++)); do
-      printf '{"index":{"_index":"%s","_id":"%s"}}\n' "$INDEX" "$i" >> "$tmp"
+      printf '{"index":{"_index":"%s"}}\n' "$INDEX" >> "$tmp"
       if (( i % 10 == 0 )); then
         printf '{"message":"error code=%s component=datafusion regex target payload-%s","status":"error","value":%s,"ts":"2026-01-01T00:00:00Z"}\n' "$i" "$i" "$i" >> "$tmp"
       else
@@ -118,7 +118,13 @@ load_sample() {
       fi
     done
 
-    curl -fsS -X POST "${OPENSEARCH_URL}/_bulk?refresh=false" -H 'Content-Type: application/x-ndjson' --data-binary "@${tmp}" >/dev/null
+    local bulk_response
+    bulk_response="$(curl -fsS -X POST "${OPENSEARCH_URL}/_bulk?refresh=false" -H 'Content-Type: application/x-ndjson' --data-binary "@${tmp}")"
+    if [[ "$bulk_response" == *'"errors":true'* || "$bulk_response" == *'"errors": true'* ]]; then
+      echo "$bulk_response" >&2
+      rm -f "$tmp"
+      exit 1
+    fi
     loaded="$end"
     echo "loaded ${loaded}/${DOCS}"
   done

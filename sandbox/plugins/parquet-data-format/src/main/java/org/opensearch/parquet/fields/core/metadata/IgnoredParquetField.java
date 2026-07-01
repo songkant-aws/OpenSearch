@@ -20,6 +20,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.Set;
 
 import static org.opensearch.index.engine.dataformat.FieldTypeCapabilities.Capability.COLUMNAR_STORAGE;
+import static org.opensearch.index.engine.dataformat.FieldTypeCapabilities.Capability.FULL_TEXT_SEARCH;
 import static org.opensearch.index.engine.dataformat.FieldTypeCapabilities.Capability.STORED_FIELDS;
 
 /**
@@ -50,6 +51,6 @@ public class IgnoredParquetField extends ParquetField {
 
     @Override
     public Set<FieldTypeCapabilities.Capability> supportedCapabilities() {
-        return Set.of(STORED_FIELDS, COLUMNAR_STORAGE);
+        return Set.of(STORED_FIELDS, COLUMNAR_STORAGE, FULL_TEXT_SEARCH);
     }
 }

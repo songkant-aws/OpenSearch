@@ -89,12 +89,16 @@ testClusters {
           systemProperty 'io.netty.noUnsafe', 'false'
           systemProperty 'io.netty.tryUnsafe', 'true'
           systemProperty 'io.netty.tryReflectionSetAccessible', 'true'
+          systemProperty 'opensearch.experimental.feature.transport.stream.enabled', 'true'
         }
         if (p.equals("parquet-data-format") || p.equals("analytics-backend-datafusion")) {
           // Composite engine / DataFusion requires pluggable dataformat feature flag
           systemProperty 'opensearch.experimental.feature.pluggable.dataformat.enabled', 'true'
           // Native lib path for DataFusion FFM bridge
-          def nativeLibDir = new File(project(':sandbox:libs:dataformat-native').projectDir, 'rust/target/release').absolutePath
+          def nativeLibOverride = project.findProperty('nativeLibOverride') ?: System.getenv('OPENSEARCH_NATIVE_LIB')
+          def nativeLibDir = nativeLibOverride
+            ? new File(nativeLibOverride.toString()).parent
+            : new File(project(':sandbox:libs:dataformat-native').projectDir, 'rust/target/release').absolutePath
           systemProperty 'java.library.path', nativeLibDir
           jvmArgs '--add-opens=java.base/java.nio=ALL-UNNAMED'
           jvmArgs '--enable-native-access=ALL-UNNAMED'
