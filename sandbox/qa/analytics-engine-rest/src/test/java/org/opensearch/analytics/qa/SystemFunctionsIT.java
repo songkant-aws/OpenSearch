@@ -76,9 +76,10 @@ public class SystemFunctionsIT extends AnalyticsRestTestCase {
         assertFirstRowString(oneRow("key00") + "| eval t = typeof(datetime0) | fields t", "TIMESTAMP");
     }
 
-    /** {@code typeof} on an arithmetic expression. {@code int0 * 2} stays INT. */
+    /** {@code typeof} on an arithmetic expression. PPL integer literals are BIGINT, so
+     *  {@code int0 * 2} is widened to BIGINT by Calcite's arithmetic type inference. */
     public void testTypeofArithmetic() throws IOException {
-        assertFirstRowString(oneRow("key00") + "| eval t = typeof(int0 * 2) | fields t", "INT");
+        assertFirstRowString(oneRow("key00") + "| eval t = typeof(int0 * 2) | fields t", "BIGINT");
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────

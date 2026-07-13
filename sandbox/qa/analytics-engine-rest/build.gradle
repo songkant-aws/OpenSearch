@@ -52,6 +52,16 @@ dependencies {
     sqlPlugin "org.opensearch.plugin:opensearch-sql-plugin:3.8.0.0-SNAPSHOT@zip"
 }
 
+// Run the complete QA module against both sides of the MPP kill switch with:
+//   ./gradlew :sandbox:qa:analytics-engine-rest:check -PqaMppEnabled=true
+//   ./gradlew :sandbox:qa:analytics-engine-rest:check -PqaMppEnabled=false
+// Keep MPP enabled by default in QA so ordinary CI exercises the distributed path. Tests that
+// temporarily change the dynamic setting reset back to this node-level matrix baseline.
+def qaMppEnabled = providers.gradleProperty('qaMppEnabled').getOrElse('true')
+if (qaMppEnabled != 'true' && qaMppEnabled != 'false') {
+    throw new GradleException("qaMppEnabled must be either 'true' or 'false', got '${qaMppEnabled}'")
+}
+
 // ── Shared cluster configuration closure ─────────────────────────────────────
 // All test clusters share the same plugin set and JVM flags; only node count
 // and feature-specific settings differ per task.
@@ -112,6 +122,10 @@ def configureAnalyticsCluster = { cluster ->
 
     // analytics-engine requires the streaming transport — fragment dispatch is streaming-only.
     cluster.systemProperty 'opensearch.experimental.feature.transport.stream.enabled', 'true'
+
+    // Matrix baseline for the MPP regression suite. This is a node setting so tests may still
+    // exercise the dynamic kill switch and reliably reset to the requested on/off baseline.
+    cluster.setting 'analytics.mpp.enabled', qaMppEnabled
 }
 
 // ── Default integTest cluster ────────────────────────────────────────────────

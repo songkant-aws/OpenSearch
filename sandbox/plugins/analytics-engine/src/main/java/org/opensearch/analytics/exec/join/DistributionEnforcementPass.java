@@ -123,7 +123,13 @@ public final class DistributionEnforcementPass {
         long minRows,
         boolean shuffleAggregateEnabled
     ) {
-        if (partitionCount <= 1) {
+        // The current dispatcher only promotes binary join-shuffle tiers. A scan-only aggregate is
+        // intentionally kept coordinator-centric below (see step 3c), so running the pass on a plan
+        // without a join cannot create an executable MPP tier. Rewriting such a plan is not harmless:
+        // peel-then-re-enforce can move an existing gather across filters/projects, change backend
+        // selection, and discard exchange-specific schema decoration such as QTF's ___ugsi column.
+        // Preserve the CBO plan byte-for-byte until unary aggregate workers are supported.
+        if (partitionCount <= 1 || RelNodeUtils.findNodes(plan, OpenSearchJoin.class).isEmpty()) {
             return plan;
         }
         DistributionEnforcementPass pass = new DistributionEnforcementPass(traitDef, partitionCount, minRows, shuffleAggregateEnabled);

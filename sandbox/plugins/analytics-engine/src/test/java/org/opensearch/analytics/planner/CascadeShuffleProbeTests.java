@@ -80,6 +80,36 @@ public class CascadeShuffleProbeTests extends BasePlannerRulesTests {
     private static final long SMALL = 1_000L;
 
     /**
+     * The general dispatcher currently promotes binary join tiers only. Enabling MPP must therefore leave
+     * a scan-only aggregate's CBO plan untouched; rebuilding it cannot add an executable worker tier and can
+     * move the existing gather across operators or lose exchange-specific schema decoration.
+     */
+    public void testEnforcementPass_noJoinPreservesCboPlan() {
+        PlannerContext context = buildMppContext(Map.of("a_idx", 3), Map.of("a_idx", LARGE));
+        RelNode scan = stubScan(mockTable("a_idx", "status", "size"));
+        AggregateCall countCall = AggregateCall.create(
+            SqlStdOperatorTable.COUNT,
+            false,
+            List.of(),
+            -1,
+            scan,
+            typeFactory.createSqlType(SqlTypeName.BIGINT),
+            "cnt"
+        );
+        RelNode cbo = runPlanner(LogicalAggregate.create(scan, List.of(), ImmutableBitSet.of(0), null, List.of(countCall)), context);
+
+        RelNode enforced = DistributionEnforcementPass.enforce(
+            cbo,
+            context.getDistributionTraitDef(),
+            CLUSTER_DATA_NODES,
+            /* minRows */ 1L,
+            /* shuffleAggregateEnabled */ true
+        );
+
+        assertSame("a plan without a join has no executable MPP tier and must retain its CBO shape", cbo, enforced);
+    }
+
+    /**
      * Option B (general enforcement pass): a 3-way shared-key join scheduled by the general
      * {@link DistributionEnforcementPass}. The pass must produce a cascade of BINARY worker tiers —
      * BOTH joins over two ShuffleExchange inputs.
