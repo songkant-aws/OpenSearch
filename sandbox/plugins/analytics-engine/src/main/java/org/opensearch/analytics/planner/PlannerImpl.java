@@ -13,7 +13,6 @@ import org.apache.calcite.plan.ConventionTraitDef;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.plan.RelTraitSet;
-import org.apache.calcite.plan.volcano.AbstractConverter;
 import org.apache.calcite.plan.volcano.VolcanoPlanner;
 import org.apache.calcite.rel.RelHomogeneousShuttle;
 import org.apache.calcite.rel.RelNode;
@@ -43,7 +42,6 @@ import org.opensearch.analytics.planner.rules.OpenSearchAggregateRule;
 import org.opensearch.analytics.planner.rules.OpenSearchAggregateSplitRule;
 import org.opensearch.analytics.planner.rules.OpenSearchBroadcastJoinSplitRule;
 import org.opensearch.analytics.planner.rules.OpenSearchDistinctCountRule;
-import org.opensearch.analytics.planner.rules.OpenSearchDistributionDeriveRule;
 import org.opensearch.analytics.planner.rules.OpenSearchFilterRule;
 import org.opensearch.analytics.planner.rules.OpenSearchHashJoinSplitRule;
 import org.opensearch.analytics.planner.rules.OpenSearchJoinRule;
@@ -52,7 +50,6 @@ import org.opensearch.analytics.planner.rules.OpenSearchLateMaterializationRewri
 import org.opensearch.analytics.planner.rules.OpenSearchProjectRule;
 import org.opensearch.analytics.planner.rules.OpenSearchSortPushdownRewriter;
 import org.opensearch.analytics.planner.rules.OpenSearchSortRule;
-import org.opensearch.analytics.planner.rules.OpenSearchSortSplitRule;
 import org.opensearch.analytics.planner.rules.OpenSearchTableScanRule;
 import org.opensearch.analytics.planner.rules.OpenSearchTopKRewriter;
 import org.opensearch.analytics.planner.rules.OpenSearchUnionRule;
@@ -546,17 +543,18 @@ public class PlannerImpl {
 
     private static RelNode cbo(RelNode marked, RelNode rawRelNode, PlannerContext context, RuleProfilingListener listener) {
         VolcanoPlanner volcanoPlanner = new VolcanoPlanner();
+        volcanoPlanner.setTopDownOpt(true);
         volcanoPlanner.addRelTraitDef(ConventionTraitDef.INSTANCE);
         OpenSearchDistributionTraitDef distTraitDef = context.getDistributionTraitDef();
         volcanoPlanner.addRelTraitDef(distTraitDef);
         volcanoPlanner.addRule(new OpenSearchAggregateSplitRule(context));
-        volcanoPlanner.addRule(new OpenSearchSortSplitRule(context));
-        volcanoPlanner.addRule(new OpenSearchJoinSplitRule(context));
+        // Top-down Volcano executes matches in stack order. Register distributed join
+        // implementations before the coordinator fallback so they establish useful upper
+        // bounds before the fallback can prune a cheaper MPP alternative.
         volcanoPlanner.addRule(new OpenSearchBroadcastJoinSplitRule(context));
         volcanoPlanner.addRule(new OpenSearchHashJoinSplitRule(context));
+        volcanoPlanner.addRule(new OpenSearchJoinSplitRule(context));
         volcanoPlanner.addRule(new OpenSearchUnionSplitRule(context));
-        volcanoPlanner.addRule(new OpenSearchDistributionDeriveRule(context));
-        volcanoPlanner.addRule(AbstractConverter.ExpandConversionRule.INSTANCE);
 
         if (listener != null) {
             volcanoPlanner.addListener(listener);
@@ -574,8 +572,8 @@ public class PlannerImpl {
 
             // Root demands SINGLETON with null locality — satisfied by either SHARD+SINGLETON
             // (1-shard scan, no ER) or COORDINATOR+SINGLETON (after ER). Multi-shard scans stamp
-            // RANDOM → ER inserted by ExpandConversionRule + trait def's convert(). Single-shard
-            // scans stamp SHARD+SINGLETON → already satisfies, no top ER.
+            // RANDOM requires an ER inserted through OpenSearchConvention.enforce(). Single-shard
+            // scans stamp SHARD+SINGLETON and already satisfy the locality-agnostic root demand.
             volcanoPlanner.setRoot(copied);
             RelTraitSet desiredTraits = copied.getTraitSet().replace(distTraitDef.anySingleton());
             if (!copied.getTraitSet().equals(desiredTraits)) {

@@ -11,7 +11,6 @@ package org.opensearch.analytics.planner.rel;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptCost;
 import org.apache.calcite.plan.RelOptPlanner;
-import org.apache.calcite.plan.RelTrait;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.RelDistribution;
 import org.apache.calcite.rel.RelNode;
@@ -23,6 +22,7 @@ import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.util.ImmutableBitSet;
+import org.apache.calcite.util.Pair;
 import org.opensearch.analytics.planner.RelNodeUtils;
 import org.opensearch.analytics.spi.AggregateFunction.IntermediateField;
 import org.opensearch.analytics.spi.FieldStorageInfo;
@@ -275,91 +275,116 @@ public class OpenSearchAggregate extends Aggregate implements OpenSearchRelNode,
         );
     }
 
-    /**
-     * SINGLE-mode aggregate over partitioned input is incorrect (each shard would aggregate
-     * independently, results would never merge). FINAL has two legal input shapes:
-     * SINGLETON+COORDINATOR (the M0/M1 coord-centric path — partials gathered to coord, FINAL
-     * merges) and HASH+WORKER (the M3 shuffle path — partials hash-shuffled by group keys,
-     * FINAL runs on each worker over its hash bucket). Anything else is rejected.
-     *
-     * <p>PARTIAL is unconstrained (it consumes whatever the child distribution is and emits
-     * partial-state output at the same locality).
-     *
-     * <p>The check tolerates ANY (Volcano's "still exploring" placeholder) on either side so the
-     * planner can register alternatives during memo expansion before the trait is finalized.
-     *
-     * <p>Cost: FINAL pays merge cost proportional to its input rows. At COORDINATOR+SINGLETON
-     * the merge runs serially → cost = inputRows. At HASH+WORKER+N the merge runs across N
-     * workers in parallel → cost = inputRows / N. The parallelism win is what makes the shuffle
-     * path beat the coord-centric path on high-cardinality {@code GROUP BY} despite paying an
-     * extra gather ER on top: for shuffle to win the savings on FINAL must exceed the extra
-     * gather ER's setup + final-output rows. This naturally amortizes only at scale, leaving
-     * tiny aggregates on coord-centric.
-     *
-     * <p><b>DO NOT REMOVE the SINGLE-mode infinite-cost branch below.</b> It is the correctness
-     * backstop for the whole split: {@code OpenSearchAggregateSplitRule} now emits a single
-     * alternative deterministically (no cost comparison), so this gate is the ONLY thing that
-     * rejects a SINGLE aggregate placed over RANDOM (multi-shard) input. Without it, Volcano can
-     * legally land a SINGLE aggregate directly on partitioned data — each shard aggregates in
-     * isolation, the partials never merge, and queries return silently wrong results. Plan-shape
-     * tests happen to catch the current shapes, but they are not a substitute for this gate;
-     * deleting it breaks correctness, not just a test.
-     */
     @Override
-    public RelOptCost computeSelfCost(RelOptPlanner planner, RelMetadataQuery mq) {
-        // SINGLE / PARTIAL placement gates (upstream): price out a SINGLE over partitioned input
-        // and a PARTIAL over singleton input so Volcano never lands them on the wrong distribution.
-        for (int index = 0; index < getInput().getTraitSet().size(); index++) {
-            RelTrait trait = getInput().getTraitSet().getTrait(index);
-            if (!(trait instanceof OpenSearchDistribution distribution)) continue;
-            boolean inputIsSingleton = distribution.getType() == RelDistribution.Type.SINGLETON
-                || distribution.getType() == RelDistribution.Type.ANY;
-
-            // Prices a SINGLE over partitioned input out (infinite cost) so it's never chosen.
-            if (mode == AggregateMode.SINGLE && !inputIsSingleton) {
-                return planner.getCostFactory().makeInfiniteCost();
+    public Pair<RelTraitSet, List<RelTraitSet>> passThroughTraits(RelTraitSet required) {
+        OpenSearchDistribution requiredDistribution = OpenSearchRelNode.distributionOf(required);
+        if (requiredDistribution == null || requiredDistribution.getType() == RelDistribution.Type.ANY) {
+            return null;
+        }
+        // SINGLE needs a structural SINGLE -> PARTIAL/FINAL implementation decision. A
+        // trait-only copy would make gather-after-SINGLE look legal even though partitioned
+        // partial results still need a merge, so leave it to AggregateSplitRule.
+        if (mode == AggregateMode.SINGLE) {
+            return null;
+        }
+        if (mode == AggregateMode.PARTIAL && requiredDistribution.getType() == RelDistribution.Type.SINGLETON) {
+            return null;
+        }
+        OpenSearchDistribution inputDistribution = requiredDistribution;
+        if (requiredDistribution.getType() == RelDistribution.Type.HASH_DISTRIBUTED) {
+            List<Integer> inputKeys = aggregateOutputKeysToInput(requiredDistribution.getKeys());
+            if (inputKeys == null) {
+                return null;
             }
-            // Prices a PARTIAL above the Exchange out (infinite cost) so it's never chosen.
-            if (mode == AggregateMode.PARTIAL && inputIsSingleton) {
-                return planner.getCostFactory().makeInfiniteCost();
+            OpenSearchDistributionTraitDef traitDef = (OpenSearchDistributionTraitDef) requiredDistribution.getTraitDef();
+            inputDistribution = requiredDistribution.getPartitionCount() == null
+                ? traitDef.hashAny(inputKeys)
+                : traitDef.hash(inputKeys, requiredDistribution.getPartitionCount());
+        } else if (mode == AggregateMode.FINAL && requiredDistribution.getType() == RelDistribution.Type.SINGLETON) {
+            OpenSearchDistributionTraitDef traitDef = (OpenSearchDistributionTraitDef) requiredDistribution.getTraitDef();
+            requiredDistribution = traitDef.coordSingleton();
+            inputDistribution = requiredDistribution;
+        }
+        return Pair.of(getTraitSet().replace(requiredDistribution), List.of(getInput().getTraitSet().replace(inputDistribution)));
+    }
+
+    @Override
+    public Pair<RelTraitSet, List<RelTraitSet>> deriveTraits(RelTraitSet childTraits, int childId) {
+        if (childId != 0) {
+            return null;
+        }
+        OpenSearchDistribution childDistribution = OpenSearchRelNode.distributionOf(childTraits);
+        if (childDistribution == null || childDistribution.getType() == RelDistribution.Type.ANY) {
+            return null;
+        }
+        if (mode == AggregateMode.SINGLE) {
+            if (childDistribution.getType() != RelDistribution.Type.SINGLETON) {
+                return null;
+            }
+            return Pair.of(getTraitSet().replace(childDistribution), List.of(childTraits));
+        }
+        if (mode == AggregateMode.PARTIAL && childDistribution.getType() == RelDistribution.Type.SINGLETON) {
+            return null;
+        }
+        OpenSearchDistribution outputDistribution = childDistribution;
+        if (childDistribution.getType() == RelDistribution.Type.HASH_DISTRIBUTED) {
+            List<Integer> outputKeys = aggregateInputKeysToOutput(childDistribution.getKeys());
+            if (outputKeys == null || childDistribution.getPartitionCount() == null) {
+                return null;
+            }
+            OpenSearchDistributionTraitDef traitDef = (OpenSearchDistributionTraitDef) childDistribution.getTraitDef();
+            outputDistribution = traitDef.hash(outputKeys, childDistribution.getPartitionCount());
+        } else if (mode == AggregateMode.FINAL) {
+            if (childDistribution.getType() != RelDistribution.Type.SINGLETON
+                || childDistribution.getLocality() != OpenSearchDistribution.Locality.COORDINATOR) {
+                return null;
             }
         }
-        // FINAL placement + parallel-merge cost (our hash-shuffle feature): FINAL is legal only over
-        // a COORDINATOR+SINGLETON gather or a WORKER+HASH shuffle, and the HASH case merges in
-        // parallel across N workers (the /partitionCount discount that lets shuffle beat coord-centric
-        // for high-cardinality GROUP BY).
+        return Pair.of(getTraitSet().replace(outputDistribution), List.of(childTraits));
+    }
+
+    private List<Integer> aggregateOutputKeysToInput(List<Integer> outputKeys) {
+        List<Integer> groupKeys = getGroupSet().asList();
+        List<Integer> inputKeys = new ArrayList<>(outputKeys.size());
+        for (int outputKey : outputKeys) {
+            if (outputKey < 0 || outputKey >= groupKeys.size()) {
+                return null;
+            }
+            inputKeys.add(groupKeys.get(outputKey));
+        }
+        return inputKeys;
+    }
+
+    private List<Integer> aggregateInputKeysToOutput(List<Integer> inputKeys) {
+        List<Integer> groupKeys = getGroupSet().asList();
+        List<Integer> outputKeys = new ArrayList<>(inputKeys.size());
+        for (int inputKey : inputKeys) {
+            int outputKey = groupKeys.indexOf(inputKey);
+            if (outputKey < 0) {
+                return null;
+            }
+            outputKeys.add(outputKey);
+        }
+        return outputKeys;
+    }
+
+    /** Aggregate execution cost after top-down traits choose a concrete mode and locality. */
+    @Override
+    public RelOptCost computeSelfCost(RelOptPlanner planner, RelMetadataQuery mq) {
+        OpenSearchDistribution selfDistribution = OpenSearchRelNode.distributionOf(getTraitSet());
+        if (selfDistribution == null || selfDistribution.getType() == RelDistribution.Type.ANY) {
+            return planner.getCostFactory().makeInfiniteCost();
+        }
         if (mode == AggregateMode.FINAL) {
             int partitionCount = 1;
-            boolean traitResolved = false;
-            for (int index = 0; index < getInput().getTraitSet().size(); index++) {
-                RelTrait trait = getInput().getTraitSet().getTrait(index);
-                if (!(trait instanceof OpenSearchDistribution distribution)) continue;
-                if (distribution.getType() == RelDistribution.Type.ANY) continue;
-                boolean singletonCoord = distribution.getType() == RelDistribution.Type.SINGLETON
-                    && distribution.getLocality() == OpenSearchDistribution.Locality.COORDINATOR;
-                boolean hashWorker = distribution.getType() == RelDistribution.Type.HASH_DISTRIBUTED
-                    && distribution.getLocality() == OpenSearchDistribution.Locality.WORKER;
-                if (!singletonCoord && !hashWorker) {
-                    return planner.getCostFactory().makeInfiniteCost();
-                }
-                traitResolved = true;
-                if (hashWorker && distribution.getPartitionCount() != null) {
-                    partitionCount = Math.max(1, distribution.getPartitionCount());
-                }
+            if (selfDistribution.getType() == RelDistribution.Type.HASH_DISTRIBUTED
+                && selfDistribution.getLocality() == OpenSearchDistribution.Locality.WORKER
+                && selfDistribution.getPartitionCount() != null) {
+                partitionCount = Math.max(1, selfDistribution.getPartitionCount());
             }
-            // FINAL pays a merge cost proportional to its input row count. Coord-centric merges
-            // serially (partitionCount=1); HASH+WORKER merges in parallel across N workers
-            // (partitionCount=N). The /N discount is what lets the shuffle path beat the
-            // coord-centric path on high-cardinality GROUP BY despite paying an extra gather
-            // ER on top — but only when the savings exceed the gather's setup, so tiny inputs
-            // still route coord-centric. Use tinyCost while the trait is unresolved (Volcano's
-            // ANY placeholder) so memo expansion can register alternatives without committing
-            // to a cost.
-            if (traitResolved) {
-                double finalRows = mq.getRowCount(getInput());
-                double finalCost = finalRows / partitionCount;
-                return planner.getCostFactory().makeCost(finalCost, finalCost, 0);
-            }
+            double finalRows = mq.getRowCount(getInput());
+            double finalCost = finalRows / partitionCount;
+            return planner.getCostFactory().makeCost(finalCost, finalCost, 0);
         }
         return planner.getCostFactory().makeTinyCost();
     }

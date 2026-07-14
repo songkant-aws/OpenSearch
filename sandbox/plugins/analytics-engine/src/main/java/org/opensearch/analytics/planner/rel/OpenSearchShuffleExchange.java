@@ -80,6 +80,11 @@ public class OpenSearchShuffleExchange extends SingleRel implements OpenSearchRe
         return new OpenSearchShuffleExchange(getCluster(), traitSet, sole(inputs), hashKeys, partitionCount, viableBackends);
     }
 
+    @Override
+    public boolean isEnforcer() {
+        return true;
+    }
+
     /** Per-partition fixed setup cost — captures TCP setup, NamedScan registration, and
      *  per-partition state on the consumer. Discourages shuffle for tiny inputs that would
      *  otherwise tie broadcast on raw transfer. */

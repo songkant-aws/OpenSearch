@@ -24,10 +24,11 @@ import java.util.List;
 /**
  * Trait definition for OpenSearch distribution.
  *
- * <p>Called by Volcano via ExpandConversionRule when a distribution trait mismatch
- * is detected. Produces an {@link OpenSearchExchangeReducer} for SINGLETON demands and
- * an {@link OpenSearchShuffleExchange} for HASH_DISTRIBUTED demands. RANGE exchanges
- * are not implemented.
+ * <p>Called by top-down Volcano through {@link OpenSearchConvention#enforce} when a
+ * distribution requirement cannot be derived naturally. Produces an
+ * {@link OpenSearchExchangeReducer} for coordinator SINGLETON demands and an
+ * {@link OpenSearchShuffleExchange} for HASH_DISTRIBUTED demands. SHARD locality is
+ * derivable but cannot be manufactured by an exchange. RANGE exchanges are not implemented.
  *
  * <p>One instance per query — created by {@link PlannerContext}.
  *
@@ -45,9 +46,8 @@ public class OpenSearchDistributionTraitDef extends RelTraitDef<OpenSearchDistri
 
     // ---- Factory methods ----
 
-    /** COORDINATOR + SINGLETON — data gathered to coord. Stamped on ER output, FINAL
-     *  aggregate output, Join/Union output; demanded by cost gates on collated Sort /
-     *  RexOver Project / Join / Union. */
+    /** COORDINATOR + SINGLETON — data gathered to coord. Stamped on ER output and
+     *  demanded by global Sort/window and coordinator Join/Union implementations. */
     public OpenSearchDistribution coordSingleton() {
         return new OpenSearchDistribution(
             this,
@@ -204,12 +204,12 @@ public class OpenSearchDistributionTraitDef extends RelTraitDef<OpenSearchDistri
      * HASH_DISTRIBUTED, {@link OpenSearchBroadcastExchange} for BROADCAST_DISTRIBUTED — WITHOUT
      * registering it with any planner. Shared by:
      * <ul>
-     *   <li>{@link #convert} (bottom-up): registers the returned rel via {@code planner.register};</li>
+     *   <li>{@link #convert}: supports explicit implementation rules that request a conversion;</li>
      *   <li>{@link OpenSearchConvention#enforce} (top-down): returns it for the planner to register.</li>
      * </ul>
-     * Returns {@code rel} unchanged when {@code toTrait} is ANY or already satisfied (caller treats that
-     * as "no exchange needed"), and never returns {@code null} today (an unenforceable demand throws).
-     * One factory so the two planner modes produce identical exchanges.
+     * Returns {@code rel} unchanged when {@code toTrait} is ANY or already satisfied. Returns
+     * {@code null} for a SHARD singleton demand because co-location can only be derived, not enforced.
+     * One factory keeps explicit implementation rules and top-down enforcement consistent.
      */
     public RelNode buildEnforcer(RelNode rel, OpenSearchDistribution toTrait) {
         OpenSearchDistribution fromTrait = rel.getTraitSet().getTrait(this);
@@ -236,11 +236,22 @@ public class OpenSearchDistributionTraitDef extends RelTraitDef<OpenSearchDistri
         CapabilityRegistry registry = plannerContext.getCapabilityRegistry();
 
         if (toTrait.getType() == RelDistribution.Type.SINGLETON) {
+            // A SHARD singleton is a physical co-location fact, not an enforceable
+            // requirement. Volcano may satisfy it through deriveTraits when every input
+            // naturally belongs to that shard, but a reducer can only gather to the
+            // coordinator. Returning null prevents an unrelated input from being wrapped in
+            // an ER falsely stamped with another table's SHARD identity.
+            if (toTrait.getLocality() == OpenSearchDistribution.Locality.SHARD) {
+                return null;
+            }
             List<String> reduceViable = CapabilityResolutionUtils.filterByReduceCapability(registry, viableBackends);
             // ER output always lives at the coordinator. Even if the demand is null-locality
             // (root demand), stamp COORDINATOR so the resulting subset is well-typed.
             OpenSearchDistribution stamp = toTrait.getLocality() == null ? coordSingleton() : toTrait;
             return new OpenSearchExchangeReducer(rel.getCluster(), rel.getTraitSet().replace(stamp), rel, reduceViable);
+        } else if (toTrait.getType() == RelDistribution.Type.RANDOM_DISTRIBUTED) {
+            // SHARD+RANDOM is scan provenance. No exchange can manufacture it.
+            return null;
         } else if (toTrait.getType() == RelDistribution.Type.HASH_DISTRIBUTED) {
             return buildShuffleExchange(rel, toTrait);
         } else if (toTrait.getType() == RelDistribution.Type.BROADCAST_DISTRIBUTED) {

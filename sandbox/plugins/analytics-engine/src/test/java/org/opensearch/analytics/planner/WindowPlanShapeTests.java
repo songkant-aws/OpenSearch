@@ -40,15 +40,14 @@ import java.util.Set;
  * {@link LogicalProject} (the shape PPL {@code eventstats} / {@code appendcol} emit).
  *
  * <p>The planner detects RexOver inside {@code OpenSearchProjectRule}, narrows viable
- * backends by {@link org.opensearch.analytics.spi.WindowCapability}, and applies a cost
- * gate that requires {@code COORDINATOR+SINGLETON} input on the project when any
- * expression is a RexOver.
+ * backends by {@link org.opensearch.analytics.spi.WindowCapability}, and exposes a top-down
+ * SINGLETON requirement when any expression is a RexOver.
  */
 public class WindowPlanShapeTests extends PlanShapeTestBase {
 
     /**
      * 1-shard with empty OVER(). Scan emits SHARD+SINGLETON which satisfies the Project's
-     * RexOver cost gate (type=SINGLETON) AND the root's locality-agnostic SINGLETON demand,
+     * RexOver trait contract and the root's locality-agnostic SINGLETON demand,
      * so no ER is inserted. The whole pipeline runs on the single shard's node.
      */
     public void testCountOverEmpty_1shard() {
@@ -585,9 +584,8 @@ public class WindowPlanShapeTests extends PlanShapeTestBase {
 
     /**
      * Window above a Join (1-shard self-join). Co-location keeps Join on the shard with no
-     * per-arm ER, but unlike a windowed Project directly above a Scan, the Project's cost
-     * gate forces an ER above the Join. Documented here so future planner work — making Join
-     * propagate SHARD+SINGLETON the same way Scan does — has a regression target.
+     * per-arm ER, and Join derives SHARD+SINGLETON to the windowed Project. The whole pipeline
+     * therefore stays on that shard without a redundant reducer.
      */
     public void testWindowAfterJoin_1shard() {
         RelNode join = makeSelfJoin();
@@ -614,17 +612,13 @@ public class WindowPlanShapeTests extends PlanShapeTestBase {
                 StubTableScan(table=[[test_index]])
             """, plan);
         RelNode result = runPlanner(plan, perIndexContext(Map.of("test_index", 1)));
-        assertPlanShape(
-            """
-                OpenSearchProject(status=[$0], size=[$1], s=[SUM($1) OVER ()], viableBackends=[[mock-parquet]])
-                  OpenSearchExchangeReducer(viableBackends=[[mock-parquet]], exchange=[ExchangeInfo[distributionType=SINGLETON, partitionKeyIndices=[], partitionCount=0]])
-                    OpenSearchJoin(condition=[=($0, $2)], joinType=[inner], viableBackends=[[mock-parquet]])
-                      OpenSearchTableScan(table=[[test_index]], viableBackends=[[mock-parquet]])
-                      OpenSearchProject(status=[$0], viableBackends=[[mock-parquet]])
-                        OpenSearchTableScan(table=[[test_index]], viableBackends=[[mock-parquet]])
-                """,
-            result
-        );
+        assertPlanShape("""
+            OpenSearchProject(status=[$0], size=[$1], s=[SUM($1) OVER ()], viableBackends=[[mock-parquet]])
+              OpenSearchJoin(condition=[=($0, $2)], joinType=[inner], viableBackends=[[mock-parquet]])
+                OpenSearchTableScan(table=[[test_index]], viableBackends=[[mock-parquet]])
+                OpenSearchProject(status=[$0], viableBackends=[[mock-parquet]])
+                  OpenSearchTableScan(table=[[test_index]], viableBackends=[[mock-parquet]])
+            """, result);
     }
 
     /**

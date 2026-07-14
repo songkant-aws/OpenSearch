@@ -10,6 +10,7 @@ package org.opensearch.analytics.planner.rules;
 
 import org.apache.calcite.plan.RelOptRule;
 import org.apache.calcite.plan.RelOptRuleCall;
+import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Project;
 import org.apache.calcite.rex.RexCall;
@@ -99,10 +100,14 @@ public class OpenSearchProjectRule extends RelOptRule {
             throw new UnsupportedFunctionException(funcNames.toString(), "in combination in this query");
         }
 
+        RelTraitSet projectTraits = child.getTraitSet();
+        if (!requiredWindowFns.isEmpty()) {
+            projectTraits = projectTraits.replace(context.getDistributionTraitDef().any());
+        }
         call.transformTo(
             new OpenSearchProject(
                 project.getCluster(),
-                child.getTraitSet(),
+                projectTraits,
                 RelNodeUtils.unwrapHep(project.getInput()),
                 annotatedExprs,
                 project.getRowType(),
@@ -286,8 +291,8 @@ public class OpenSearchProjectRule extends RelOptRule {
     }
 
     /** Collects {@link WindowFunction}s used by any {@link RexOver} in {@code exprs}.
-     *  Unrecognized window SqlKinds (LAG, LEAD, NTILE, etc.) fail here. The SINGLETON cost gate
-     *  on RexOver-bearing projects guarantees PARTITION BY / ORDER BY see fully-gathered input. */
+     *  Unrecognized window SqlKinds (LAG, LEAD, NTILE, etc.) fail here. The Project's top-down
+     *  SINGLETON contract guarantees PARTITION BY / ORDER BY see fully-gathered input. */
     private static Set<WindowFunction> collectWindowFunctions(List<? extends RexNode> exprs) {
         Set<WindowFunction> fns = new LinkedHashSet<>();
         for (RexNode expr : exprs) {

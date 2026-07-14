@@ -10,6 +10,7 @@ package org.opensearch.analytics.planner.rules;
 
 import org.apache.calcite.plan.RelOptRule;
 import org.apache.calcite.plan.RelOptRuleCall;
+import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Sort;
 import org.opensearch.analytics.planner.PlannerContext;
@@ -62,12 +63,17 @@ public class OpenSearchSortRule extends RelOptRule {
             throw new IllegalStateException("No backend supports SORT capability among " + childViableBackends);
         }
 
+        boolean global = !sort.getCollation().getFieldCollations().isEmpty() || sort.fetch != null || sort.offset != null;
+        RelTraitSet sortTraits = child.getTraitSet();
+        if (global) {
+            sortTraits = sortTraits.replace(context.getDistributionTraitDef().any());
+        }
         // plus(): Calcite's Sort constructor asserts the trait set contains the collation.
         // replace() is a no-op if the slot is missing; plus() appends or overrides.
         call.transformTo(
             new OpenSearchSort(
                 sort.getCluster(),
-                child.getTraitSet().plus(sort.getCollation()),
+                sortTraits.plus(sort.getCollation()),
                 RelNodeUtils.unwrapHep(sort.getInput()),
                 sort.getCollation(),
                 sort.offset,

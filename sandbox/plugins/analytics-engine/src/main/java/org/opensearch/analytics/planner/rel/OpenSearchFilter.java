@@ -19,6 +19,7 @@ import org.apache.calcite.rel.logical.LogicalFilter;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.util.Pair;
 import org.opensearch.analytics.planner.RelNodeUtils;
 import org.opensearch.analytics.spi.FieldStorageInfo;
 
@@ -68,6 +69,29 @@ public class OpenSearchFilter extends Filter implements OpenSearchRelNode, Distr
     @Override
     public RelOptCost computeSelfCost(RelOptPlanner planner, RelMetadataQuery mq) {
         return planner.getCostFactory().makeTinyCost();
+    }
+
+    @Override
+    public Pair<RelTraitSet, List<RelTraitSet>> passThroughTraits(RelTraitSet required) {
+        OpenSearchDistribution requiredDistribution = OpenSearchRelNode.distributionOf(required);
+        if (requiredDistribution == null) {
+            return null;
+        }
+        RelTraitSet outputTraits = getTraitSet().replace(requiredDistribution);
+        RelTraitSet inputTraits = getInput().getTraitSet().replace(requiredDistribution);
+        return Pair.of(outputTraits, List.of(inputTraits));
+    }
+
+    @Override
+    public Pair<RelTraitSet, List<RelTraitSet>> deriveTraits(RelTraitSet childTraits, int childId) {
+        if (childId != 0) {
+            return null;
+        }
+        OpenSearchDistribution childDistribution = OpenSearchRelNode.distributionOf(childTraits);
+        if (childDistribution == null) {
+            return null;
+        }
+        return Pair.of(getTraitSet().replace(childDistribution), List.of(childTraits));
     }
 
     // ---- DistributionAware (Option B post-CBO enforcement pass) ----

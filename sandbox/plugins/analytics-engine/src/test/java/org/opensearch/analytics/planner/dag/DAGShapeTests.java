@@ -90,31 +90,24 @@ public class DAGShapeTests extends BasePlannerRulesTests {
     // ── Join DAG shapes ──────────────────────────────────────────────────────
     //
     // Case 1 (1-shard same table) — co-location fast path. Both inputs scan the same 1-shard
-    // index; Join runs at SHARD with no per-side ER. The aggregate above demands SINGLETON,
-    // gathered via one ER between Aggregate and Join → 2 stages total.
+    // index; Join and its scalar aggregate derive SHARD+SINGLETON with no ER → 1 stage total.
     //
     // Cases 2-4 — general path. Each input is gathered to coord via a per-side ER → 3 stages.
 
     public void testJoinDag_case1_singleShardSameTable() {
         PlannerContext context = buildContext("parquet", 1, intFields());
         QueryDAG dag = buildDAG(context, buildJoinWithStatsShape("test_index", "test_index"));
-        assertDagShape(
-            """
-                QueryDAG(queryId=<random>)
-                Stage 1
-                  OpenSearchAggregate(group=[{}], cnt=[COUNT()], mode=[SINGLE], viableBackends=[[mock-parquet]])
-                    OpenSearchExchangeReducer(viableBackends=[[mock-parquet]], exchange=[ExchangeInfo[distributionType=SINGLETON, partitionKeyIndices=[], partitionCount=0]])
-                      OpenSearchStageInputScan(childStageId=[0], viableBackends=[[mock-parquet]])
-                  Stage 0 exchange=SINGLETON
-                    OpenSearchJoin(condition=[=($0, $1)], joinType=[left], viableBackends=[[mock-parquet]])
-                      OpenSearchProject(status=[$0], viableBackends=[[mock-parquet]])
-                        OpenSearchTableScan(table=[[test_index]], viableBackends=[[mock-parquet]])
-                      OpenSearchSort(fetch=[50000], viableBackends=[[mock-parquet]])
-                        OpenSearchProject(status=[$0], viableBackends=[[mock-parquet]])
-                          OpenSearchTableScan(table=[[test_index]], viableBackends=[[mock-parquet]])
-                """,
-            dag
-        );
+        assertDagShape("""
+            QueryDAG(queryId=<random>)
+            Stage 0
+              OpenSearchAggregate(group=[{}], cnt=[COUNT()], mode=[SINGLE], viableBackends=[[mock-parquet]])
+                OpenSearchJoin(condition=[=($0, $1)], joinType=[left], viableBackends=[[mock-parquet]])
+                  OpenSearchProject(status=[$0], viableBackends=[[mock-parquet]])
+                    OpenSearchTableScan(table=[[test_index]], viableBackends=[[mock-parquet]])
+                  OpenSearchSort(fetch=[50000], viableBackends=[[mock-parquet]])
+                    OpenSearchProject(status=[$0], viableBackends=[[mock-parquet]])
+                      OpenSearchTableScan(table=[[test_index]], viableBackends=[[mock-parquet]])
+            """, dag);
     }
 
     public void testJoinDag_case2_multiShardSameTable() {

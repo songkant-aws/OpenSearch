@@ -32,8 +32,7 @@ import java.util.List;
  * can insert a single gather ER above it.
  *
  * <p><b>General path.</b> Otherwise, request {@code COORDINATOR+SINGLETON} on each
- * arm. Volcano's {@code ExpandConversionRule} +
- * {@link OpenSearchDistributionTraitDef#convert} then materialize an
+ * arm. Top-down convention enforcement then materializes an
  * {@link org.opensearch.analytics.planner.rel.OpenSearchExchangeReducer} on any arm
  * not already at {@code COORDINATOR+SINGLETON}.
  *

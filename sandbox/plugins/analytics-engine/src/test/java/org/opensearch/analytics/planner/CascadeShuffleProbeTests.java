@@ -1187,7 +1187,7 @@ public class CascadeShuffleProbeTests extends BasePlannerRulesTests {
         Map<String, Long> rowCounts = Map.of("a_idx", SMALL, "b_idx", LARGE, "c_idx", LARGE);
         PlannerContext context = buildMppContext(shardCounts, rowCounts);
 
-        RelNode cbo = runPlanner(makeThreeWayJoin(context), context);
+        RelNode cbo = runPlanner(makeThreeWayJoinWithDifferentTopKey(), context);
         RelNode enforced = DistributionEnforcementPass.enforce(cbo, context.getDistributionTraitDef(), CLUSTER_DATA_NODES, 1L, true);
 
         // The mixed shape: a preserved broadcast AND a shuffle in the same enforced DAG. (Exact counts depend
@@ -1218,7 +1218,7 @@ public class CascadeShuffleProbeTests extends BasePlannerRulesTests {
         Map<String, Long> rowCounts = Map.of("a_idx", SMALL, "b_idx", LARGE, "c_idx", LARGE);
         PlannerContext context = buildMppContext(shardCounts, rowCounts);
 
-        RelNode cbo = runPlanner(makeThreeWayJoin(context), context);
+        RelNode cbo = runPlanner(makeThreeWayJoinWithDifferentTopKey(), context);
         RelNode enforced = DistributionEnforcementPass.enforce(cbo, context.getDistributionTraitDef(), CLUSTER_DATA_NODES, 1L, true);
         QueryDAG dag = DAGBuilder.build(enforced, context.getCapabilityRegistry(), mockClusterService(), TEST_RESOLVER);
 
@@ -1296,6 +1296,35 @@ public class CascadeShuffleProbeTests extends BasePlannerRulesTests {
         RexNode abcCond = rexBuilder.makeCall(
             SqlStdOperatorTable.EQUALS,
             rexBuilder.makeInputRef(intType, 0),
+            rexBuilder.makeInputRef(intType, abCols)
+        );
+        return LogicalJoin.create(ab, cScan, List.of(), abcCond, Set.of(), JoinRelType.INNER);
+    }
+
+    /**
+     * Same three-way shape, but the top join uses {@code a.col1 = c.col0}. The different
+     * top key prevents CBO from reusing the bottom join's HASH(col0) distribution, which
+     * keeps the broadcast-under-shuffle transport tests focused on that mixed execution
+     * shape instead of the valid same-key hash-reuse optimization.
+     */
+    private RelNode makeThreeWayJoinWithDifferentTopKey() {
+        RelNode aScan = stubScan(mockTable("a_idx", "status", "size"));
+        RelNode bScan = stubScan(mockTable("b_idx", "status", "size"));
+        RelNode cScan = stubScan(mockTable("c_idx", "status", "size"));
+        RelDataType intType = typeFactory.createSqlType(SqlTypeName.INTEGER);
+
+        int aCols = aScan.getRowType().getFieldCount();
+        RexNode abCond = rexBuilder.makeCall(
+            SqlStdOperatorTable.EQUALS,
+            rexBuilder.makeInputRef(intType, 0),
+            rexBuilder.makeInputRef(intType, aCols)
+        );
+        RelNode ab = LogicalJoin.create(aScan, bScan, List.of(), abCond, Set.of(), JoinRelType.INNER);
+
+        int abCols = ab.getRowType().getFieldCount();
+        RexNode abcCond = rexBuilder.makeCall(
+            SqlStdOperatorTable.EQUALS,
+            rexBuilder.makeInputRef(intType, 1),
             rexBuilder.makeInputRef(intType, abCols)
         );
         return LogicalJoin.create(ab, cScan, List.of(), abcCond, Set.of(), JoinRelType.INNER);

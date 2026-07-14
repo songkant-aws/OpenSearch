@@ -88,6 +88,11 @@ public class OpenSearchBroadcastExchange extends SingleRel implements OpenSearch
     }
 
     @Override
+    public boolean isEnforcer() {
+        return true;
+    }
+
+    @Override
     public RelOptCost computeSelfCost(RelOptPlanner planner, RelMetadataQuery mq) {
         double rows = mq.getRowCount(getInput());
         // Broadcast moves N copies of the row set, where N = probe-node count. Each copy

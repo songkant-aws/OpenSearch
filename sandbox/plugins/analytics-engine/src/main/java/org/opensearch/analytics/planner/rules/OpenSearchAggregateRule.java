@@ -103,7 +103,9 @@ public class OpenSearchAggregateRule extends RelOptRule {
 
         LOGGER.debug("Aggregate viable backends: {} (child viable: {})", viableBackends, childViableBackends);
 
-        RelTraitSet aggregateTraits = child.getTraitSet();
+        // SINGLE is an unresolved physical aggregate. AggregateSplitRule chooses either
+        // SINGLE-on-coordinator or PARTIAL/FINAL and stamps the concrete distribution.
+        RelTraitSet aggregateTraits = child.getTraitSet().replace(context.getDistributionTraitDef().any());
 
         call.transformTo(
             new OpenSearchAggregate(

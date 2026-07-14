@@ -8,13 +8,20 @@
 
 package org.opensearch.analytics.planner.rel;
 
+import org.apache.calcite.plan.RelTrait;
+import org.apache.calcite.plan.RelTraitSet;
+import org.apache.calcite.plan.volcano.RelSubset;
+import org.apache.calcite.rel.PhysicalNode;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.util.Pair;
 import org.opensearch.analytics.spi.FieldStorageInfo;
 import org.opensearch.analytics.spi.FragmentConvertor;
 
 import java.util.List;
 import java.util.function.Function;
+
+import org.checkerframework.checker.nullness.qual.Nullable;
 
 /**
  * Marker interface for all OpenSearch custom RelNodes that carry backend assignment
@@ -30,7 +37,70 @@ import java.util.function.Function;
  *
  * @opensearch.internal
  */
-public interface OpenSearchRelNode {
+public interface OpenSearchRelNode extends PhysicalNode {
+
+    /** Returns the OpenSearch distribution carried by {@code traits}, if any. */
+    static @Nullable OpenSearchDistribution distributionOf(RelTraitSet traits) {
+        for (int i = 0; i < traits.size(); i++) {
+            RelTrait trait = traits.getTrait(i);
+            if (trait instanceof OpenSearchDistribution distribution) {
+                return distribution;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Returns the common table id when the subtree can naturally execute at one shard.
+     * This is a provenance check, not an enforceable trait: every leaf must originate from
+     * the same one-shard table.
+     */
+    static @Nullable Integer singleShardTableId(RelNode rel) {
+        RelNode current = rel instanceof RelSubset subset ? subset.getBestOrOriginal() : rel;
+        if (current == null || current == rel && rel instanceof RelSubset) {
+            return null;
+        }
+        OpenSearchDistribution distribution = distributionOf(current.getTraitSet());
+        if (distribution != null
+            && distribution.getLocality() == OpenSearchDistribution.Locality.SHARD
+            && distribution.getType() == org.apache.calcite.rel.RelDistribution.Type.SINGLETON
+            && Integer.valueOf(1).equals(distribution.getShardCount())
+            && distribution.getTableId() != null) {
+            return distribution.getTableId();
+        }
+        if (current.getInputs().isEmpty()) {
+            return null;
+        }
+        Integer commonTableId = null;
+        for (RelNode input : current.getInputs()) {
+            Integer tableId = singleShardTableId(input);
+            if (tableId == null) {
+                return null;
+            }
+            if (commonTableId == null) {
+                commonTableId = tableId;
+            } else if (commonTableId.equals(tableId) == false) {
+                return null;
+            }
+        }
+        return commonTableId;
+    }
+
+    /**
+     * Most OpenSearch operators do not propagate physical traits. Operators that are
+     * transparent to, require, or derive a distribution override these hooks explicitly.
+     * Returning {@code null} is Calcite's contract for "no alternative" and keeps newly
+     * introduced operators safe when top-down Volcano optimization is enabled.
+     */
+    @Override
+    default @Nullable Pair<RelTraitSet, List<RelTraitSet>> passThroughTraits(RelTraitSet required) {
+        return null;
+    }
+
+    @Override
+    default @Nullable Pair<RelTraitSet, List<RelTraitSet>> deriveTraits(RelTraitSet childTraits, int childId) {
+        return null;
+    }
 
     /** All backends that could execute this operator, including via delegation. */
     List<String> getViableBackends();

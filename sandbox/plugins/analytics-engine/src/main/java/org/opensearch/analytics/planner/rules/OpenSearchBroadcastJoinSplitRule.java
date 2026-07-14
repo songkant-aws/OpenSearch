@@ -270,7 +270,7 @@ public class OpenSearchBroadcastJoinSplitRule extends RelOptRule {
      * Emits one broadcast alternative: the chosen build side is wrapped in a broadcast
      * exchange (via trait conversion); the other side (probe) keeps its SHARD trait. The
      * join's own trait is the probe side's SHARD+RANDOM, which propagates the probe's
-     * tableId so the cost gate can validate.
+     * tableId so parent trait derivation preserves the probe locality.
      *
      * @param leftIsBuild true if the left side is broadcast (probe = right); false otherwise.
      */
@@ -290,7 +290,7 @@ public class OpenSearchBroadcastJoinSplitRule extends RelOptRule {
 
         // Probe side keeps its SHARD+RANDOM trait — no exchange. The join sits at the same
         // trait so it runs alongside the probe scan on probe-side data nodes. The
-        // distribution copy preserves probe's tableId / shardCount (used by the cost gate).
+        // Distribution copy preserves probe's tableId / shardCount for parent derivation.
         RelTraitSet joinTraits = join.getTraitSet().replace(distTraitDef.from(probeDist));
         RelNode workerJoin;
         if (leftIsBuild) {

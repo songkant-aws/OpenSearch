@@ -130,7 +130,7 @@ public class AggregateSplitCostTests extends PlanShapeTestBase {
     /**
      * {@code where <4 eq-preds> | stats count() by status_code}, multi-shard — the PARTIAL must
      * stay below the Exchange. Two ingredients make the bad coordinator-PARTIAL look cheaper, so
-     * this exercises the gate that forbids it:
+     * this exercises the structural split and trait contract that forbid it:
      * <ul>
      *   <li>Row count 100 + 4 {@code =} conjuncts: default 0.25 selectivity floors the estimate to
      *       1.0 row, erasing the coordinator-PARTIAL's cost margin over the shard-PARTIAL+ER.</li>
@@ -138,8 +138,7 @@ public class AggregateSplitCostTests extends PlanShapeTestBase {
      *       state (key + count), so shipping rows below a coordinator-PARTIAL beats shipping the
      *       partial state above a shard-PARTIAL.</li>
      * </ul>
-     * Comment out the gate in {@code OpenSearchAggregate.computeSelfCost} and this fails with the
-     * FINAL → coordinator-PARTIAL → ER bad shape.
+     * The planner must never register FINAL → coordinator-PARTIAL → ER as a legal alternative.
      */
     public void testFourPredicateFilterBelowCountByKey_2shard_partialStaysBelowExchange() {
         // HTTP-access-log shape: count() by status_code, filtered on 4 fields.
@@ -187,8 +186,8 @@ public class AggregateSplitCostTests extends PlanShapeTestBase {
      * {@code avg(size) by status_code} decomposes to SUM + COUNT primitives at the shard, reduced
      * additively at the coordinator. 7 {@code =} conjuncts drive the row-count estimate to the 1.0
      * floor; the narrowing Project (status_code, size) keeps the shipped row narrower than the
-     * 3-column PARTIAL state, so without the gate the coordinator-PARTIAL wins on cost. The gate
-     * keeps the SUM/COUNT PARTIAL below the Exchange.
+     * 3-column PARTIAL state, so a cost-only legality check would favor coordinator-PARTIAL. The
+     * structural split keeps the SUM/COUNT PARTIAL below the Exchange.
      */
     public void testSevenPredicateFilterBelowAvgByKey_2shard_partialStaysBelowExchange() {
         Map<String, Map<String, Object>> fields = new LinkedHashMap<>();
@@ -235,10 +234,9 @@ public class AggregateSplitCostTests extends PlanShapeTestBase {
     }
 
     /**
-     * Aggregate over a Join at multi-shard must NOT split. A Join gathers both inputs to the
-     * coordinator (its {@code computeSelfCost} is infinite over non-SINGLETON input), so the
-     * aggregate's input is already singleton — {@code childForcesGather} stops at the Join and the
-     * rule emits a single SINGLE aggregate.
+     * Aggregate over a coordinator Join must NOT split. The join's trait contract gathers both
+     * inputs, so the aggregate's input is already singleton — {@code childForcesGather} stops at
+     * the Join and the rule emits a single SINGLE aggregate.
      */
     public void testAggregateOverJoin_2shard_doesNotSplit() {
         RelOptTable left = mockTable("test_index", "status", "size");

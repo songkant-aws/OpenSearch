@@ -20,6 +20,7 @@ import org.apache.calcite.rel.core.Union;
 import org.apache.calcite.rel.logical.LogicalUnion;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.sql.type.SqlTypeName;
+import org.apache.calcite.util.Pair;
 import org.opensearch.analytics.planner.RelNodeUtils;
 import org.opensearch.analytics.spi.FieldStorageInfo;
 
@@ -99,39 +100,55 @@ public class OpenSearchUnion extends Union implements OpenSearchRelNode {
         return new OpenSearchUnion(getCluster(), traitSet, inputs, all, viableBackends);
     }
 
-    /**
-     * Cost gate. Locality of the union must match its arms:
-     * <ul>
-     *   <li>{@code COORDINATOR+SINGLETON} union → every arm must be {@code COORDINATOR+SINGLETON}.
-     *       OpenSearchUnionSplitRule's general path inserts ERs to satisfy this.</li>
-     *   <li>{@code SHARD+SINGLETON} union (co-location fast path) → every arm must be
-     *       {@code SHARD+SINGLETON} with the union's {@code tableId} and {@code shardCount=1}.</li>
-     * </ul>
-     */
+    @Override
+    public Pair<RelTraitSet, List<RelTraitSet>> passThroughTraits(RelTraitSet required) {
+        OpenSearchDistribution requiredDistribution = OpenSearchRelNode.distributionOf(required);
+        if (requiredDistribution == null || requiredDistribution.getType() != RelDistribution.Type.SINGLETON) {
+            return null;
+        }
+        OpenSearchDistributionTraitDef traitDef = (OpenSearchDistributionTraitDef) requiredDistribution.getTraitDef();
+        OpenSearchDistribution singleton = traitDef.coordSingleton();
+        List<RelTraitSet> inputTraits = getInputs().stream().map(input -> input.getTraitSet().replace(singleton)).toList();
+        return Pair.of(getTraitSet().replace(singleton), inputTraits);
+    }
+
+    @Override
+    public Pair<RelTraitSet, List<RelTraitSet>> deriveTraits(RelTraitSet childTraits, int childId) {
+        if (childId < 0 || childId >= getInputs().size()) {
+            return null;
+        }
+        OpenSearchDistribution childDistribution = OpenSearchRelNode.distributionOf(childTraits);
+        if (childDistribution == null
+            || childDistribution.getType() != RelDistribution.Type.SINGLETON
+            || (childDistribution.getLocality() != OpenSearchDistribution.Locality.COORDINATOR
+                && childDistribution.getLocality() != OpenSearchDistribution.Locality.SHARD)) {
+            return null;
+        }
+        if (childDistribution.getLocality() == OpenSearchDistribution.Locality.SHARD
+            && (Integer.valueOf(1).equals(childDistribution.getShardCount()) == false || childDistribution.getTableId() == null)) {
+            return null;
+        }
+        if (childDistribution.getLocality() == OpenSearchDistribution.Locality.SHARD) {
+            for (int i = 0; i < getInputs().size(); i++) {
+                if (i != childId
+                    && childDistribution.getTableId().equals(OpenSearchRelNode.singleShardTableId(getInputs().get(i))) == false) {
+                    return null;
+                }
+            }
+        }
+        List<RelTraitSet> inputTraits = new ArrayList<>(
+            getInputs().stream().map(input -> input.getTraitSet().replace(childDistribution)).toList()
+        );
+        inputTraits.set(childId, childTraits);
+        return Pair.of(getTraitSet().replace(childDistribution), inputTraits);
+    }
+
+    /** Union execution cost after trait propagation establishes its input locality. */
     @Override
     public RelOptCost computeSelfCost(RelOptPlanner planner, RelMetadataQuery mq) {
         OpenSearchDistribution selfDist = distributionOf(this);
         if (selfDist == null || selfDist.getType() != RelDistribution.Type.SINGLETON) {
             return planner.getCostFactory().makeInfiniteCost();
-        }
-        for (RelNode input : getInputs()) {
-            OpenSearchDistribution inputDist = distributionOf(input);
-            if (inputDist == null) continue;
-            if (inputDist.getType() == RelDistribution.Type.ANY) continue;
-            if (inputDist.getType() != RelDistribution.Type.SINGLETON) {
-                return planner.getCostFactory().makeInfiniteCost();
-            }
-            if (selfDist.getLocality() != inputDist.getLocality()) {
-                return planner.getCostFactory().makeInfiniteCost();
-            }
-            if (selfDist.getLocality() == OpenSearchDistribution.Locality.SHARD) {
-                if (selfDist.getTableId() == null || !selfDist.getTableId().equals(inputDist.getTableId())) {
-                    return planner.getCostFactory().makeInfiniteCost();
-                }
-                if (!Integer.valueOf(1).equals(inputDist.getShardCount())) {
-                    return planner.getCostFactory().makeInfiniteCost();
-                }
-            }
         }
         return planner.getCostFactory().makeTinyCost();
     }

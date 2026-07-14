@@ -12,6 +12,7 @@ import org.apache.calcite.plan.RelOptPlanner;
 import org.apache.calcite.plan.RelTrait;
 import org.apache.calcite.plan.RelTraitDef;
 import org.apache.calcite.rel.RelDistribution;
+import org.apache.calcite.util.mapping.IntPair;
 import org.apache.calcite.util.mapping.Mappings;
 
 import java.util.ArrayList;
@@ -195,7 +196,16 @@ public class OpenSearchDistribution implements RelDistribution {
         // back to ANY when the mapping drops a key we depend on.
         List<Integer> newKeys = new ArrayList<>(keys.size());
         for (int key : keys) {
-            int target = mapping.getTargetOpt(key);
+            int target = -1;
+            // Some Calcite projection mappings expose only the inverse lookup direction;
+            // iterating the mapping pairs works for both implementations. If an input is
+            // projected more than once, either output position preserves the hash key.
+            for (IntPair pair : mapping) {
+                if (pair.source == key) {
+                    target = pair.target;
+                    break;
+                }
+            }
             if (target < 0) {
                 return new OpenSearchDistribution(traitDef, null, Type.ANY, List.of(), null, null, null);
             }

@@ -14,6 +14,7 @@ import org.apache.calcite.plan.RelOptPlanner;
 import org.apache.calcite.plan.RelTrait;
 import org.apache.calcite.plan.RelTraitDef;
 import org.apache.calcite.plan.RelTraitSet;
+import org.apache.calcite.rel.RelNode;
 
 /**
  * Calcite convention for all OpenSearch Analytics operators.
@@ -33,6 +34,17 @@ public enum OpenSearchConvention implements Convention {
     @Override
     public String getName() {
         return "OPENSEARCH";
+    }
+
+    @Override
+    public RelNode enforce(RelNode input, RelTraitSet required) {
+        for (int i = 0; i < required.size(); i++) {
+            RelTrait trait = required.getTrait(i);
+            if (trait instanceof OpenSearchDistribution distribution) {
+                return ((OpenSearchDistributionTraitDef) distribution.getTraitDef()).buildEnforcer(input, distribution);
+            }
+        }
+        return null;
     }
 
     @Override

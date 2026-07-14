@@ -11,6 +11,7 @@ package org.opensearch.analytics.planner.rules;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptRule;
 import org.apache.calcite.plan.RelOptRuleCall;
+import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.core.AggregateCall;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
@@ -19,7 +20,9 @@ import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
 import org.opensearch.analytics.planner.rel.OpenSearchAggregate;
+import org.opensearch.analytics.planner.rel.OpenSearchDistribution;
 import org.opensearch.analytics.planner.rel.OpenSearchProject;
+import org.opensearch.analytics.planner.rel.OpenSearchRelNode;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -40,7 +43,7 @@ import java.util.List;
  * <p>The DataFusion converter re-inlines the literal from the directly-attached Project. Without the split,
  * width-cost pushes the single literal-bearing Project below the gather, the converter can't reach the
  * literal, and percentile errors "must be a literal" / take returns an empty array. The pinned upper copy
- * ({@link OpenSearchProject#isPinAboveExchange()}, infinite cost unless input is gathered) keeps the literal
+ * ({@link OpenSearchProject#isPinAboveExchange()}, top-down coordinator requirement) keeps the literal
  * in the coordinator fragment; the unpinned lower copy narrows the scan. {@code argList} is untouched.
  *
  * <p>Runs after marking, before CBO — {@code PROJECT_MERGE} (pre-marking) can't re-fuse the copies, and the
@@ -137,9 +140,16 @@ public class OpenSearchAggLiteralArgProjectSplitRule extends RelOptRule {
                 upperExprs.add(rexBuilder.makeInputRef(lowerRowType.getFieldList().get(slot).getType(), slot));
             }
         }
+        OpenSearchDistribution projectDistribution = OpenSearchRelNode.distributionOf(project.getTraitSet());
+        RelTraitSet upperTraits = project.getTraitSet();
+        if (projectDistribution != null) {
+            upperTraits = upperTraits.replace(
+                ((org.opensearch.analytics.planner.rel.OpenSearchDistributionTraitDef) projectDistribution.getTraitDef()).any()
+            );
+        }
         OpenSearchProject upper = new OpenSearchProject(
             cluster,
-            project.getTraitSet(),
+            upperTraits,
             lower,
             upperExprs,
             project.getRowType(),

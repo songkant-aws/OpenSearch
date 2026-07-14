@@ -26,10 +26,11 @@ import java.util.List;
  *       parent join/aggregate keyed on the same column consumes it with no further exchange.</li>
  * </ol>
  *
- * <p>This is the SAME logic {@code presto_poc}'s {@code OpenSearchJoin.passThroughTraits}/
- * {@code deriveTraits} expressed as Volcano {@code PhysicalNode} hooks — but as plain methods the
- * enforcement pass calls in bottom-up mode, so we do NOT flip the optimizer to top-down. Each operator's
- * implementation is unit-testable in isolation.
+ * <p>Calcite CBO now uses {@code PhysicalNode.passThroughTraits/deriveTraits} as the source of
+ * truth for choosing physical alternatives. This interface remains as a compatibility bridge for
+ * the post-CBO execution pass, which has additional runtime-only responsibilities that Calcite's
+ * memo does not model yet: binary worker-tier boundaries, forced inter-tier shuffles, and preserving
+ * the selected broadcast transport while building the execution DAG.
  *
  * <p>An operator that does not implement this interface is treated by the pass as "no distribution
  * requirement on its inputs, output distribution unknown" — i.e. the pass leaves its inputs as the

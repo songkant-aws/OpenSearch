@@ -11,7 +11,6 @@ package org.opensearch.analytics.planner.rel;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptCost;
 import org.apache.calcite.plan.RelOptPlanner;
-import org.apache.calcite.plan.RelTrait;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.RelDistribution;
 import org.apache.calcite.rel.RelNode;
@@ -26,6 +25,7 @@ import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.rex.RexOver;
 import org.apache.calcite.rex.RexShuttle;
+import org.apache.calcite.util.Pair;
 import org.opensearch.analytics.planner.RelNodeUtils;
 import org.opensearch.analytics.spi.FieldStorageInfo;
 
@@ -47,8 +47,7 @@ public class OpenSearchProject extends Project implements OpenSearchRelNode, Dis
 
     /**
      * When true, this Project must stay ABOVE the ExchangeReducer (in the coordinator fragment) —
-     * {@link #computeSelfCost} returns infinite cost unless its input is already gathered
-     * (SINGLETON/ANY), forcing Volcano to place an ER below it. Used to keep an aggregate's literal
+     * its top-down trait contract requires coordinator SINGLETON input. Used to keep an aggregate's literal
      * config arg (e.g. percentile's {@code 50}) adjacent to the aggregate while a duplicate,
      * unpinned, physical-only Project pushes below the gather for projection-pushdown. Mirrors the
      * RexOver gate, which has the same coordinator-side requirement.
@@ -117,12 +116,88 @@ public class OpenSearchProject extends Project implements OpenSearchRelNode, Dis
         return new OpenSearchProject(getCluster(), traitSet, input, projects, rowType, viableBackends, pinAboveExchange);
     }
 
+    @Override
+    public Pair<RelTraitSet, List<RelTraitSet>> passThroughTraits(RelTraitSet required) {
+        OpenSearchDistribution requiredDistribution = OpenSearchRelNode.distributionOf(required);
+        if (requiredDistribution == null || requiredDistribution.getType() == RelDistribution.Type.ANY) {
+            return null;
+        }
+
+        if (containsOver() || pinAboveExchange) {
+            if (requiredDistribution.getType() != RelDistribution.Type.SINGLETON) {
+                return null;
+            }
+            OpenSearchDistributionTraitDef traitDef = (OpenSearchDistributionTraitDef) requiredDistribution.getTraitDef();
+            OpenSearchDistribution singleton = traitDef.coordSingleton();
+            return Pair.of(getTraitSet().replace(singleton), List.of(getInput().getTraitSet().replace(singleton)));
+        }
+
+        OpenSearchDistribution inputDistribution = requiredDistribution;
+        if (requiredDistribution.getType() == RelDistribution.Type.HASH_DISTRIBUTED) {
+            List<Integer> inputKeys = new ArrayList<>(requiredDistribution.getKeys().size());
+            for (int outputKey : requiredDistribution.getKeys()) {
+                if (outputKey < 0 || outputKey >= getProjects().size() || !(getProjects().get(outputKey) instanceof RexInputRef ref)) {
+                    // A computed/dropped key cannot be pushed below the Project. Let the
+                    // convention place a shuffle above this node instead.
+                    return null;
+                }
+                inputKeys.add(ref.getIndex());
+            }
+            OpenSearchDistributionTraitDef traitDef = (OpenSearchDistributionTraitDef) requiredDistribution.getTraitDef();
+            inputDistribution = requiredDistribution.getPartitionCount() == null
+                ? traitDef.hashAny(inputKeys)
+                : traitDef.hash(inputKeys, requiredDistribution.getPartitionCount());
+        }
+        return Pair.of(getTraitSet().replace(requiredDistribution), List.of(getInput().getTraitSet().replace(inputDistribution)));
+    }
+
+    @Override
+    public Pair<RelTraitSet, List<RelTraitSet>> deriveTraits(RelTraitSet childTraits, int childId) {
+        if (childId != 0) {
+            return null;
+        }
+        OpenSearchDistribution childDistribution = OpenSearchRelNode.distributionOf(childTraits);
+        if (childDistribution == null || childDistribution.getType() == RelDistribution.Type.ANY) {
+            return null;
+        }
+        if ((containsOver() || pinAboveExchange) && childDistribution.getType() != RelDistribution.Type.SINGLETON) {
+            return null;
+        }
+        OpenSearchDistribution outputDistribution = remapChildDistribution(childDistribution);
+        if (outputDistribution == null || outputDistribution.getType() == RelDistribution.Type.ANY) return null;
+        return Pair.of(getTraitSet().replace(outputDistribution), List.of(childTraits));
+    }
+
+    private OpenSearchDistribution remapChildDistribution(OpenSearchDistribution childDistribution) {
+        if (childDistribution.getType() != RelDistribution.Type.HASH_DISTRIBUTED) {
+            return childDistribution;
+        }
+        List<Integer> outputKeys = new ArrayList<>(childDistribution.getKeys().size());
+        for (int inputKey : childDistribution.getKeys()) {
+            int outputKey = -1;
+            for (int i = 0; i < getProjects().size(); i++) {
+                if (getProjects().get(i) instanceof RexInputRef ref && ref.getIndex() == inputKey) {
+                    outputKey = i;
+                    break;
+                }
+            }
+            if (outputKey < 0) {
+                return null;
+            }
+            outputKeys.add(outputKey);
+        }
+        OpenSearchDistributionTraitDef traitDef = (OpenSearchDistributionTraitDef) childDistribution.getTraitDef();
+        return childDistribution.getPartitionCount() == null
+            ? traitDef.hashAny(outputKeys)
+            : traitDef.hash(outputKeys, childDistribution.getPartitionCount());
+    }
+
     /**
      * Projects containing {@code RexOver} (window functions) need fully-gathered input so the
      * window's global frame semantics are correct. Projects flagged {@link #pinAboveExchange} must
      * likewise stay in the coordinator fragment (they carry an aggregate's literal config arg). Both
-     * return infinite cost unless input is SINGLETON/ANY — Volcano then picks the plan where an ER
-     * sits under this project.
+     * are created with an unresolved ANY distribution; their trait hook is the only path to a
+     * concrete coordinator implementation.
      *
      * <p>Plain projects (neither) have no ordering requirement — tiny cost unconditionally.
      */
@@ -131,16 +206,9 @@ public class OpenSearchProject extends Project implements OpenSearchRelNode, Dis
         if (!containsOver() && !pinAboveExchange) {
             return planner.getCostFactory().makeTinyCost();
         }
-        // containsOver() is Calcite's own — inherited from Project.
-        for (int i = 0; i < getInput().getTraitSet().size(); i++) {
-            RelTrait trait = getInput().getTraitSet().getTrait(i);
-            if (trait instanceof OpenSearchDistribution distribution) {
-                boolean singletonOrAny = distribution.getType() == RelDistribution.Type.SINGLETON
-                    || distribution.getType() == RelDistribution.Type.ANY;
-                if (!singletonOrAny) {
-                    return planner.getCostFactory().makeInfiniteCost();
-                }
-            }
+        OpenSearchDistribution distribution = OpenSearchRelNode.distributionOf(getTraitSet());
+        if (distribution == null || distribution.getType() != RelDistribution.Type.SINGLETON) {
+            return planner.getCostFactory().makeInfiniteCost();
         }
         return planner.getCostFactory().makeTinyCost();
     }
@@ -183,12 +251,7 @@ public class OpenSearchProject extends Project implements OpenSearchRelNode, Dis
         if (containsOver() || pinAboveExchange) {
             return traitDef.coordSingleton();
         }
-        org.apache.calcite.util.mapping.Mappings.TargetMapping mapping = Project.getPartialMapping(
-            getInput().getRowType().getFieldCount(),
-            getProjects()
-        );
-        org.apache.calcite.rel.RelDistribution remapped = childDist.apply(mapping);
-        return remapped instanceof OpenSearchDistribution osDist ? osDist : null;
+        return remapChildDistribution(childDist);
     }
 
     @Override

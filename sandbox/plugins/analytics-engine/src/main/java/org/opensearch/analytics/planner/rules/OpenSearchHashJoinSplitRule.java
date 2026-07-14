@@ -28,8 +28,8 @@ import org.opensearch.analytics.planner.rel.OpenSearchTableScan;
 /**
  * Hash-shuffle split rule for {@link OpenSearchJoin} (M2). Sibling of
  * {@link OpenSearchJoinSplitRule}. Both fire on the same operand; this one emits a
- * HASH-localized alternative that {@code OpenSearchJoin}'s cost gate accepts when both inputs
- * deliver matching {@code WORKER+HASH(keys, partitionCount)} traits. The result is a join
+ * HASH-localized alternative whose trait contract requires both inputs to deliver matching
+ * {@code WORKER+HASH(keys, partitionCount)} traits. The result is a join
  * that runs on data-node workers in parallel, with Volcano materializing
  * {@link org.opensearch.analytics.planner.rel.OpenSearchShuffleExchange} on each input via
  * the trait converter.
@@ -156,8 +156,8 @@ public class OpenSearchHashJoinSplitRule extends RelOptRule {
         RelNode shuffledRight = convert(join.getRight(), rightTraits);
 
         // The hash-join itself runs at WORKER+HASH(leftKeys, N). Convention: use the left
-        // keys as the join's own hash key marker (the cost gate validates each input's HASH
-        // independently — it doesn't compare the join's keys to inputs').
+        // keys as the join's own hash key marker; OpenSearchJoin's derive contract uses the
+        // matching left/right equi keys for future parent requirements.
         OpenSearchDistribution joinHash = distTraitDef.hash(info.leftKeys, partitionCount);
         RelTraitSet joinTraits = join.getTraitSet().replace(joinHash);
         RelNode workerJoin = join.copy(

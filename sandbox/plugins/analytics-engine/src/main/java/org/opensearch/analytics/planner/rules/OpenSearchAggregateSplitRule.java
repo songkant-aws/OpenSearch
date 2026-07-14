@@ -35,6 +35,7 @@ import org.opensearch.analytics.planner.rel.OpenSearchDistribution;
 import org.opensearch.analytics.planner.rel.OpenSearchFilter;
 import org.opensearch.analytics.planner.rel.OpenSearchJoin;
 import org.opensearch.analytics.planner.rel.OpenSearchProject;
+import org.opensearch.analytics.planner.rel.OpenSearchRelNode;
 import org.opensearch.analytics.planner.rel.OpenSearchSort;
 import org.opensearch.analytics.planner.rel.OpenSearchUnion;
 import org.opensearch.analytics.spi.AggregateFunction;
@@ -154,7 +155,16 @@ public class OpenSearchAggregateSplitRule extends RelOptRule {
         OpenSearchAggregate aggregate = call.rel(0);
         RelNode child = call.rel(1);
 
-        RelTraitSet singletonTraits = aggregate.getTraitSet().replace(context.getDistributionTraitDef().coordSingleton());
+        OpenSearchDistribution childDistribution = OpenSearchRelNode.distributionOf(child.getTraitSet());
+        OpenSearchDistribution singleDistribution = childDistribution != null
+            && childDistribution.getType() == RelDistribution.Type.SINGLETON
+                ? childDistribution
+                : context.getDistributionTraitDef().coordSingleton();
+        // Preserve a one-shard input's SHARD+SINGLETON trait. A single-stage aggregate is
+        // node-local in that shape and does not need a reducer; changing it to COORDINATOR
+        // here destroys the co-location information consumed by Join/Union. Multi-shard
+        // and otherwise unresolved inputs still use the coordinator alternative.
+        RelTraitSet singletonTraits = aggregate.getTraitSet().replace(singleDistribution);
         RelNode singletonChild = convert(child, singletonTraits);
         OpenSearchAggregate singleOnSingleton = new OpenSearchAggregate(
             aggregate.getCluster(),
@@ -242,7 +252,7 @@ public class OpenSearchAggregateSplitRule extends RelOptRule {
      * aggregate over it would be incorrect. Reads the input's distribution trait directly — the
      * same deterministic, shard-count-driven signal the Join/Union split rules use, no cost model
      * involved. Returns false for SINGLETON (1 shard / already gathered) or when no distribution
-     * trait is present yet (Volcano still exploring — the cost gate on SINGLE is the backstop).
+     * trait is present yet (Volcano is still exploring an unresolved alternative).
      */
     private static boolean isPartitioned(RelNode input) {
         for (int i = 0; i < input.getTraitSet().size(); i++) {
@@ -261,8 +271,7 @@ public class OpenSearchAggregateSplitRule extends RelOptRule {
      * PARTIAL is unsatisfiable). Walks the single-input chain, descending past pass-through
      * Projects (no {@code RexOver}) and Filters; stops at the first gather-forcing op or a terminal.
      *
-     * <p>Gather-forcing operators (each returns infinite cost over non-SINGLETON input in its own
-     * {@code computeSelfCost}, so Volcano gathers below them):
+     * <p>Gather-forcing operators (their top-down trait contract requires coordinator input):
      * <ul>
      *   <li>collated or limited {@link OpenSearchSort} (global order/limit can't run per-shard);</li>
      *   <li>a {@code RexOver}-bearing {@link OpenSearchProject} (window needs gathered input);</li>
@@ -275,9 +284,8 @@ public class OpenSearchAggregateSplitRule extends RelOptRule {
     private static boolean childForcesGather(RelNode node) {
         RelNode cur = unwrapForWalk(node);
         while (cur != null) {
-            // Gather-forcing operators: each returns infinite cost over non-SINGLETON input in its
-            // own computeSelfCost (verified: Sort-collated/limited, RexOver-Project, Join, Union,
-            // nested Aggregate), so Volcano gathers below them → our input is already singleton.
+            // These operators expose only a coordinator implementation for this path, so the
+            // aggregate input is already singleton.
             if (cur instanceof OpenSearchSort sort) {
                 return !sort.getCollation().getFieldCollations().isEmpty() || sort.fetch != null || sort.offset != null;
             }

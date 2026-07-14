@@ -18,7 +18,6 @@ import org.apache.calcite.rel.logical.LogicalJoin;
 import org.opensearch.analytics.planner.PlannerContext;
 import org.opensearch.analytics.planner.RelNodeUtils;
 import org.opensearch.analytics.planner.rel.OpenSearchDistributionTraitDef;
-import org.opensearch.analytics.planner.rel.OpenSearchExchangeReducer;
 import org.opensearch.analytics.planner.rel.OpenSearchJoin;
 import org.opensearch.analytics.planner.rel.OpenSearchRelNode;
 import org.opensearch.analytics.spi.JoinCapability;
@@ -29,9 +28,9 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * HEP marker rewriting {@link LogicalJoin} → {@link OpenSearchJoin}. Both inputs are
- * gathered to the coordinator (enforced by the join's cost gate, which only accepts
- * SINGLETON inputs — Volcano inserts an {@link OpenSearchExchangeReducer} per side).
+ * HEP marker rewriting {@link LogicalJoin} → {@link OpenSearchJoin}. It leaves
+ * distribution unresolved so top-down Volcano can compare coordinator, co-located,
+ * hash-shuffle, and broadcast implementations.
  *
  * <p>Accepts INNER / LEFT / RIGHT / FULL / SEMI / ANTI joins of any condition
  * shape — pure equi (hash join), mixed equi + non-equi (hash on the equi keys
@@ -87,12 +86,13 @@ public class OpenSearchJoinRule extends RelOptRule {
                 "No backend supports join kind [" + requiredKind + "] among viable backends " + candidateBackends
             );
         }
-        // HEP marking only — no ER insertion. OpenSearchJoin's cost gate (SINGLETON input
-        // required) drives Volcano to insert ERs on each input via TraitDef.convert.
+        // HEP marking only — no ER insertion or strategy selection.
         OpenSearchDistributionTraitDef distTraitDef = context.getDistributionTraitDef();
         RelNode leftUnwrapped = RelNodeUtils.unwrapHep(join.getLeft());
         RelNode rightUnwrapped = RelNodeUtils.unwrapHep(join.getRight());
-        RelTraitSet joinTraits = leftUnwrapped.getTraitSet().replace(distTraitDef.coordSingleton());
+        // Leave strategy unresolved. Top-down passThroughTraits can satisfy a coordinator
+        // demand, while the broadcast/hash rules add their own physical alternatives.
+        RelTraitSet joinTraits = leftUnwrapped.getTraitSet().replace(distTraitDef.any());
         OpenSearchJoin osJoin = new OpenSearchJoin(
             join.getCluster(),
             joinTraits,

@@ -8,6 +8,7 @@
 
 package org.opensearch.analytics.planner.rel;
 
+import org.apache.calcite.plan.DeriveMode;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.RelNode;
@@ -18,6 +19,7 @@ import org.apache.calcite.rel.core.JoinInfo;
 import org.apache.calcite.rel.core.JoinRelType;
 import org.apache.calcite.rel.logical.LogicalJoin;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.util.Pair;
 import org.opensearch.analytics.planner.RelNodeUtils;
 import org.opensearch.analytics.spi.FieldStorageInfo;
 
@@ -26,9 +28,9 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * Join rel carrying viable backends. Both sides are gathered SINGLETON to the
- * coordinator (enforced by {@link #computeSelfCost}). {@code right} is always the
- * build side (matches substrait {@code JoinRel.right}).
+ * Join rel carrying viable backends. Top-down traits expose coordinator, co-located
+ * single-shard, hash-shuffle, and broadcast implementations; cost ranks only concrete
+ * legal alternatives. {@code right} is always the build side in Substrait.
  *
  * <p>Implements {@link DistributionAware}: under the post-CBO distribution-enforcement pass (Option B,
  * {@code MPP-GENERAL-SCHEDULING-DESIGN.md}), an INNER/LEFT/RIGHT/FULL/SEMI/ANTI equi-join can co-partition
@@ -93,40 +95,129 @@ public class OpenSearchJoin extends Join implements OpenSearchRelNode, Distribut
         return new OpenSearchJoin(getCluster(), traitSet, left, right, conditionExpr, joinType, viableBackends);
     }
 
-    /**
-     * Cost gate. The join's locality must match its inputs' locality:
-     * <ul>
-     *   <li>If the join is at {@code COORDINATOR+SINGLETON}, every input must also be
-     *       {@code COORDINATOR+SINGLETON}. {@code OpenSearchJoinSplitRule} drives this
-     *       by calling {@code convert(input, COORDINATOR+SINGLETON)} which inserts an ER
-     *       wherever the input doesn't already deliver that.</li>
-     *   <li>If the join is at {@code SHARD+SINGLETON} (co-location fast path), every input
-     *       must also be {@code SHARD+SINGLETON} with the same {@code tableId} and
-     *       {@code shardCount=1}. Anything else is infinite cost.</li>
-     *   <li>If the join is at {@code WORKER+HASH(keys, N)} (post-shuffle hash join), every
-     *       input must also be {@code WORKER+HASH(keys, N)} with the same key set and the
-     *       same partition count. {@code OpenSearchHashJoinSplitRule} drives this by
-     *       demanding the appropriate per-side HASH on each input; Volcano materializes
-     *       an {@link OpenSearchShuffleExchange} on any input not already so distributed.</li>
-     * </ul>
-     */
+    @Override
+    public Pair<RelTraitSet, List<RelTraitSet>> passThroughTraits(RelTraitSet required) {
+        OpenSearchDistribution requiredDistribution = OpenSearchRelNode.distributionOf(required);
+        if (requiredDistribution == null || requiredDistribution.getType() != org.apache.calcite.rel.RelDistribution.Type.SINGLETON) {
+            return null;
+        }
+        OpenSearchDistributionTraitDef traitDef = (OpenSearchDistributionTraitDef) requiredDistribution.getTraitDef();
+        OpenSearchDistribution singleton = traitDef.coordSingleton();
+        return Pair.of(
+            getTraitSet().replace(singleton),
+            List.of(getLeft().getTraitSet().replace(singleton), getRight().getTraitSet().replace(singleton))
+        );
+    }
+
+    @Override
+    public Pair<RelTraitSet, List<RelTraitSet>> deriveTraits(RelTraitSet childTraits, int childId) {
+        if (childId != 0 && childId != 1) {
+            return null;
+        }
+        OpenSearchDistribution childDistribution = OpenSearchRelNode.distributionOf(childTraits);
+        if (childDistribution == null || childDistribution.getType() == org.apache.calcite.rel.RelDistribution.Type.ANY) {
+            return null;
+        }
+        OpenSearchDistributionTraitDef traitDef = (OpenSearchDistributionTraitDef) childDistribution.getTraitDef();
+
+        if (childDistribution.getType() == org.apache.calcite.rel.RelDistribution.Type.SINGLETON
+            && childDistribution.getLocality() == OpenSearchDistribution.Locality.SHARD
+            && Integer.valueOf(1).equals(childDistribution.getShardCount())
+            && childDistribution.getTableId() != null
+            && childDistribution.getTableId().equals(OpenSearchRelNode.singleShardTableId(childId == 0 ? getRight() : getLeft()))) {
+            List<RelTraitSet> inputs = new ArrayList<>(
+                List.of(getLeft().getTraitSet().replace(childDistribution), getRight().getTraitSet().replace(childDistribution))
+            );
+            inputs.set(childId, childTraits);
+            return Pair.of(getTraitSet().replace(childDistribution), inputs);
+        }
+
+        if (childDistribution.getType() == org.apache.calcite.rel.RelDistribution.Type.SINGLETON
+            && childDistribution.getLocality() == OpenSearchDistribution.Locality.COORDINATOR) {
+            OpenSearchDistribution singleton = traitDef.coordSingleton();
+            List<RelTraitSet> inputs = new ArrayList<>(
+                List.of(getLeft().getTraitSet().replace(singleton), getRight().getTraitSet().replace(singleton))
+            );
+            inputs.set(childId, childTraits);
+            return Pair.of(getTraitSet().replace(singleton), inputs);
+        }
+
+        JoinInfo info = analyzeCondition();
+        if (info.leftKeys.isEmpty()) {
+            return null;
+        }
+        if (childDistribution.getType() == org.apache.calcite.rel.RelDistribution.Type.HASH_DISTRIBUTED
+            && childDistribution.getLocality() == OpenSearchDistribution.Locality.WORKER
+            && childDistribution.getPartitionCount() != null) {
+            List<Integer> expectedKeys = childId == 0 ? info.leftKeys : info.rightKeys;
+            if (!childDistribution.getKeys().equals(expectedKeys)) {
+                return null;
+            }
+            int partitionCount = childDistribution.getPartitionCount();
+            OpenSearchDistribution leftHash = traitDef.hash(info.leftKeys, partitionCount);
+            OpenSearchDistribution rightHash = traitDef.hash(info.rightKeys, partitionCount);
+            List<RelTraitSet> inputs = new ArrayList<>(
+                List.of(getLeft().getTraitSet().replace(leftHash), getRight().getTraitSet().replace(rightHash))
+            );
+            inputs.set(childId, childTraits);
+            return Pair.of(getTraitSet().replace(leftHash), inputs);
+        }
+
+        return deriveBroadcastTraits(childTraits, childId, childDistribution);
+    }
+
+    private Pair<RelTraitSet, List<RelTraitSet>> deriveBroadcastTraits(
+        RelTraitSet childTraits,
+        int childId,
+        OpenSearchDistribution childDistribution
+    ) {
+        RelNode other = childId == 0 ? getRight() : getLeft();
+        OpenSearchDistribution otherDistribution = distributionOf(other);
+        if (otherDistribution == null) {
+            return null;
+        }
+        boolean childIsBuild = childDistribution.getType() == org.apache.calcite.rel.RelDistribution.Type.BROADCAST_DISTRIBUTED
+            && childDistribution.getLocality() == OpenSearchDistribution.Locality.REPLICATED;
+        boolean otherIsBuild = otherDistribution.getType() == org.apache.calcite.rel.RelDistribution.Type.BROADCAST_DISTRIBUTED
+            && otherDistribution.getLocality() == OpenSearchDistribution.Locality.REPLICATED;
+        OpenSearchDistribution probeDistribution = childIsBuild ? otherDistribution : childDistribution;
+        boolean probeIsShard = probeDistribution.getType() == org.apache.calcite.rel.RelDistribution.Type.RANDOM_DISTRIBUTED
+            && probeDistribution.getLocality() == OpenSearchDistribution.Locality.SHARD;
+        if (probeIsShard == false || childIsBuild == otherIsBuild) {
+            return null;
+        }
+        int buildId = childIsBuild ? childId : 1 - childId;
+        boolean buildAllowed = buildId == 0
+            ? getJoinType() == JoinRelType.INNER || getJoinType() == JoinRelType.RIGHT
+            : getJoinType() == JoinRelType.INNER
+                || getJoinType() == JoinRelType.LEFT
+                || getJoinType() == JoinRelType.SEMI
+                || getJoinType() == JoinRelType.ANTI;
+        if (buildAllowed == false) {
+            return null;
+        }
+        List<RelTraitSet> inputs = new ArrayList<>(List.of(getLeft().getTraitSet(), getRight().getTraitSet()));
+        inputs.set(childId, childTraits);
+        return Pair.of(getTraitSet().replace(probeDistribution), inputs);
+    }
+
+    @Override
+    public DeriveMode getDeriveMode() {
+        return DeriveMode.BOTH;
+    }
+
+    /** Join execution cost after trait propagation has established a legal physical shape. */
     @Override
     public org.apache.calcite.plan.RelOptCost computeSelfCost(
         org.apache.calcite.plan.RelOptPlanner planner,
         org.apache.calcite.rel.metadata.RelMetadataQuery mq
     ) {
         OpenSearchDistribution selfDist = distributionOf(this);
-        if (selfDist == null) {
+        if (selfDist == null || selfDist.getType() == org.apache.calcite.rel.RelDistribution.Type.ANY) {
             return planner.getCostFactory().makeInfiniteCost();
         }
         org.apache.calcite.rel.RelDistribution.Type selfType = selfDist.getType();
         OpenSearchDistribution.Locality selfLocality = selfDist.getLocality();
-        // Three legal join shapes:
-        // 1. SINGLETON: COORDINATOR+SINGLETON (coord-centric) or SHARD+SINGLETON (1-shard
-        // co-location). Inputs match self exactly.
-        // 2. HASH+WORKER: hash-shuffle. Inputs are both HASH+WORKER with the same N.
-        // 3. RANDOM+SHARD: broadcast. Inputs are one BROADCAST+REPLICATED (build) and one
-        // SHARD-localized (probe); the join runs alongside the probe scan.
         boolean isSingleton = selfType == org.apache.calcite.rel.RelDistribution.Type.SINGLETON;
         boolean isHashWorker = selfType == org.apache.calcite.rel.RelDistribution.Type.HASH_DISTRIBUTED
             && selfLocality == OpenSearchDistribution.Locality.WORKER;
@@ -135,61 +226,33 @@ public class OpenSearchJoin extends Join implements OpenSearchRelNode, Distribut
         if (!isSingleton && !isHashWorker && !isBroadcastShape) {
             return planner.getCostFactory().makeInfiniteCost();
         }
-        // For broadcast shape, exactly one input must be BROADCAST+REPLICATED (the build) and
-        // the other must be SHARD-localized matching the join's own SHARD+tableId.
-        int broadcastBuildSeen = 0;
-        int probeShardSeen = 0;
-        for (RelNode input : getInputs()) {
-            OpenSearchDistribution inputDist = distributionOf(input);
-            if (inputDist == null) continue;
-            if (inputDist.getType() == org.apache.calcite.rel.RelDistribution.Type.ANY) continue;
-
-            if (isBroadcastShape) {
-                if (inputDist.getType() == org.apache.calcite.rel.RelDistribution.Type.BROADCAST_DISTRIBUTED
-                    && inputDist.getLocality() == OpenSearchDistribution.Locality.REPLICATED) {
-                    broadcastBuildSeen++;
-                    continue;
-                }
-                if (inputDist.getType() == org.apache.calcite.rel.RelDistribution.Type.RANDOM_DISTRIBUTED
-                    && inputDist.getLocality() == OpenSearchDistribution.Locality.SHARD
-                    && selfDist.getTableId() != null
-                    && selfDist.getTableId().equals(inputDist.getTableId())) {
-                    probeShardSeen++;
-                    continue;
-                }
-                return planner.getCostFactory().makeInfiniteCost();
-            }
-
-            // Non-broadcast shapes: inputs must match join's distribution type.
-            if (inputDist.getType() != selfType) {
-                return planner.getCostFactory().makeInfiniteCost();
-            }
-            if (selfDist.getLocality() != inputDist.getLocality()) {
-                return planner.getCostFactory().makeInfiniteCost();
-            }
-            if (isSingleton) {
-                if (selfDist.getLocality() == OpenSearchDistribution.Locality.SHARD) {
-                    if (selfDist.getTableId() == null || !selfDist.getTableId().equals(inputDist.getTableId())) {
-                        return planner.getCostFactory().makeInfiniteCost();
-                    }
-                    if (!Integer.valueOf(1).equals(inputDist.getShardCount())) {
-                        return planner.getCostFactory().makeInfiniteCost();
-                    }
-                }
-            } else {
-                // HASH+WORKER: partitionCount must agree on each input. Per-input keys may
-                // differ (left.k1 = right.k2), so we don't compare keys here — that's the
-                // exchange's job at trait conversion.
-                if (!Integer.valueOf(selfDist.getPartitionCount() == null ? -1 : selfDist.getPartitionCount())
-                    .equals(inputDist.getPartitionCount())) {
-                    return planner.getCostFactory().makeInfiniteCost();
+        // passThroughTraits/deriveTraits and the implementation rules establish physical
+        // legality. Cost is now only the join work itself. It must not be tiny: in top-down
+        // mode the root gather above
+        // a distributed join participates in the same global comparison as the input gathers
+        // of a coordinator join. Without a strategy-sensitive execution cost, those common
+        // large-row transport terms cancel and coordinator execution wins merely because it
+        // gathers the small side once instead of broadcasting it, ignoring the parallel join
+        // work that broadcast/hash-shuffle actually buy.
+        double inputRows = mq.getRowCount(getLeft()) + mq.getRowCount(getRight());
+        int parallelism = 1;
+        if (isHashWorker && selfDist.getPartitionCount() != null) {
+            parallelism = Math.max(1, selfDist.getPartitionCount());
+        } else if (isBroadcastShape) {
+            // The replicated input carries the number of probe-side workers in the same
+            // partitionCount slot used by the broadcast exchange's cost model.
+            for (RelNode input : getInputs()) {
+                OpenSearchDistribution inputDist = distributionOf(input);
+                if (inputDist != null
+                    && inputDist.getType() == org.apache.calcite.rel.RelDistribution.Type.BROADCAST_DISTRIBUTED
+                    && inputDist.getPartitionCount() != null) {
+                    parallelism = Math.max(1, inputDist.getPartitionCount());
+                    break;
                 }
             }
         }
-        if (isBroadcastShape && (broadcastBuildSeen != 1 || probeShardSeen != 1)) {
-            return planner.getCostFactory().makeInfiniteCost();
-        }
-        return planner.getCostFactory().makeTinyCost();
+        double executionCost = inputRows / parallelism;
+        return planner.getCostFactory().makeCost(executionCost, executionCost, 0);
     }
 
     private static OpenSearchDistribution distributionOf(RelNode rel) {
@@ -231,7 +294,7 @@ public class OpenSearchJoin extends Join implements OpenSearchRelNode, Distribut
      * {@code WORKER+HASH(leftKeys, N)} — left key columns keep their output positions (left fields come
      * first in the join row type), so a parent keyed on the same column consumes it without a re-shuffle.
      * Anchored on the LEFT side only (the engine convention used by {@code OpenSearchHashJoinSplitRule} and
-     * the cost gate). Returns {@code null} (output not co-partitionable) when the left input is not
+     * the join's physical trait). Returns {@code null} (output not co-partitionable) when the left input is not
      * hash-partitioned on exactly the left equi keys, or for a pure-theta join.
      */
     @Override

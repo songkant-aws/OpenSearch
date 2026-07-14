@@ -48,16 +48,7 @@ public class RuleProfilingListenerTests extends BasePlannerRulesTests {
         runAndAssertRules(
             1,
             "SELECT URL FROM hits",
-            Map.of(
-                "ReduceExpressionsRule(Project)",
-                0L,
-                "OpenSearchProjectRule",
-                1L,
-                "OpenSearchTableScanRule",
-                1L,
-                "ExpandConversionRule",
-                1L
-            )
+            Map.of("ReduceExpressionsRule(Project)", 0L, "OpenSearchProjectRule", 1L, "OpenSearchTableScanRule", 1L)
         );
     }
 
@@ -75,8 +66,6 @@ public class RuleProfilingListenerTests extends BasePlannerRulesTests {
                 "OpenSearchProjectRule",
                 1L,
                 "OpenSearchTableScanRule",
-                1L,
-                "ExpandConversionRule",
                 1L
             )
         );
@@ -95,9 +84,7 @@ public class RuleProfilingListenerTests extends BasePlannerRulesTests {
                 Map.entry("OpenSearchTableScanRule", 1L),
                 Map.entry("OpenSearchAggregateRule", 1L),
                 Map.entry("OpenSearchAggregateSplitRule", 1L),
-                Map.entry("OpenSearchAggLiteralArgProjectSplitRule", 0L),
-                Map.entry("OpenSearchDistributionDeriveRule", 3L),
-                Map.entry("ExpandConversionRule", 5L)
+                Map.entry("OpenSearchAggLiteralArgProjectSplitRule", 0L)
             )
         );
     }
@@ -114,11 +101,9 @@ public class RuleProfilingListenerTests extends BasePlannerRulesTests {
                 Map.entry("OpenSearchProjectRule", 2L),
                 Map.entry("OpenSearchJoinRule", 1L),
                 Map.entry("OpenSearchAggregateRule", 1L),
-                Map.entry("OpenSearchAggregateSplitRule", 1L),
+                Map.entry("OpenSearchAggregateSplitRule", 5L),
                 Map.entry("OpenSearchJoinSplitRule", 1L),
-                Map.entry("OpenSearchAggLiteralArgProjectSplitRule", 0L),
-                Map.entry("OpenSearchDistributionDeriveRule", 1L),
-                Map.entry("ExpandConversionRule", 3L)
+                Map.entry("OpenSearchAggLiteralArgProjectSplitRule", 0L)
             )
         );
     }

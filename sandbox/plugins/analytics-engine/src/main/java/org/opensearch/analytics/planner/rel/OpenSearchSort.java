@@ -11,7 +11,6 @@ package org.opensearch.analytics.planner.rel;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptCost;
 import org.apache.calcite.plan.RelOptPlanner;
-import org.apache.calcite.plan.RelTrait;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.RelCollation;
 import org.apache.calcite.rel.RelDistribution;
@@ -21,6 +20,7 @@ import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.logical.LogicalSort;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.util.Pair;
 import org.opensearch.analytics.planner.RelNodeUtils;
 import org.opensearch.analytics.spi.FieldStorageInfo;
 
@@ -102,13 +102,48 @@ public class OpenSearchSort extends Sort implements OpenSearchRelNode {
         return false;
     }
 
+    @Override
+    public Pair<RelTraitSet, List<RelTraitSet>> passThroughTraits(RelTraitSet required) {
+        OpenSearchDistribution requiredDistribution = OpenSearchRelNode.distributionOf(required);
+        if (requiredDistribution == null || requiredDistribution.getType() == RelDistribution.Type.ANY) {
+            return null;
+        }
+        boolean global = perPartition == false && (!getCollation().getFieldCollations().isEmpty() || fetch != null || offset != null);
+        OpenSearchDistribution outputDistribution = requiredDistribution;
+        OpenSearchDistribution inputDistribution = requiredDistribution;
+        if (global) {
+            if (requiredDistribution.getType() != RelDistribution.Type.SINGLETON) {
+                return null;
+            }
+            OpenSearchDistributionTraitDef traitDef = (OpenSearchDistributionTraitDef) requiredDistribution.getTraitDef();
+            outputDistribution = traitDef.coordSingleton();
+            inputDistribution = outputDistribution;
+        }
+        return Pair.of(getTraitSet().replace(outputDistribution), List.of(getInput().getTraitSet().replace(inputDistribution)));
+    }
+
+    @Override
+    public Pair<RelTraitSet, List<RelTraitSet>> deriveTraits(RelTraitSet childTraits, int childId) {
+        if (childId != 0) {
+            return null;
+        }
+        boolean global = perPartition == false && (!getCollation().getFieldCollations().isEmpty() || fetch != null || offset != null);
+        OpenSearchDistribution childDistribution = OpenSearchRelNode.distributionOf(childTraits);
+        if (childDistribution == null || childDistribution.getType() == RelDistribution.Type.ANY) {
+            return null;
+        }
+        if (global && childDistribution.getType() != RelDistribution.Type.SINGLETON) {
+            return null;
+        }
+        return Pair.of(getTraitSet().replace(childDistribution), List.of(childTraits));
+    }
+
     /**
      * A collated Sort needs globally-ordered input. Our {@link OpenSearchExchangeReducer}
      * is a concat gather (not a merge exchange), so per-partition sort + ER produces
      * partition-locally ordered rows concatenated in arrival order — wrong. Returning
-     * infinite cost unless the input is EXECUTION(SINGLETON) forces Volcano to pick the
-     * {@link org.opensearch.analytics.planner.rules.OpenSearchSortSplitRule} alternative
-     * (ER below the Sort, Sort sees a fully-gathered input).
+     * top-down trait contract admits only the coordinator implementation (ER below the
+     * Sort, so the Sort sees fully-gathered input).
      *
      * <p>A Sort with no collation AND no fetch/offset is a no-op — skip the gate.
      * A pure LIMIT (fetch != null, no collation) still needs gathering so it applies globally.
@@ -118,17 +153,9 @@ public class OpenSearchSort extends Sort implements OpenSearchRelNode {
         if (getCollation().getFieldCollations().isEmpty() && fetch == null && offset == null) {
             return planner.getCostFactory().makeTinyCost();
         }
-        for (RelNode input : getInputs()) {
-            for (int i = 0; i < input.getTraitSet().size(); i++) {
-                RelTrait trait = input.getTraitSet().getTrait(i);
-                if (trait instanceof OpenSearchDistribution distribution) {
-                    boolean singletonOrAny = distribution.getType() == RelDistribution.Type.SINGLETON
-                        || distribution.getType() == RelDistribution.Type.ANY;
-                    if (!singletonOrAny) {
-                        return planner.getCostFactory().makeInfiniteCost();
-                    }
-                }
-            }
+        OpenSearchDistribution distribution = OpenSearchRelNode.distributionOf(getTraitSet());
+        if (distribution == null || distribution.getType() != RelDistribution.Type.SINGLETON) {
+            return planner.getCostFactory().makeInfiniteCost();
         }
         return planner.getCostFactory().makeTinyCost();
     }
