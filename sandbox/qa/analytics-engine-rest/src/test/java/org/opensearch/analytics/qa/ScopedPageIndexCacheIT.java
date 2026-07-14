@@ -515,10 +515,14 @@ public class ScopedPageIndexCacheIT extends AnalyticsRestTestCase {
         assertPositive("pre-merge: CI misses across both segments", ciMisses(premerge));
         assertPositive("pre-merge: OI misses across both segments", oiMisses(premerge));
         assertPositive("pre-merge: metadata populated", metaMemoryBytes(premerge));
-        // CI: 2 files × age(col 1) × 1 RG each = 2 entries
-        assertExactCiEntries("pre-merge: CI entries = 2 (2 files × age × rg)", 2L);
-        // OI: 2 files × {col_0(name), age(col 1)} = 4 entries
-        assertExactOiEntries("pre-merge: OI entries = 4 (2 files × {col_0,age})", 4L);
+        // A refresh makes prior writes visible but does not guarantee one physical parquet file:
+        // concurrent flush scheduling can split either 500-row bulk into more than one segment.
+        // Pin the semantic shape instead of the exact pre-merge topology: at least the two refresh
+        // generations are present; CI has one age entry per file and OI has name+age per file.
+        long premergeCiEntries = ciEntries(premerge);
+        long premergeOiEntries = oiEntries(premerge);
+        assertTrue("pre-merge: expected at least two CI entries, got " + premergeCiEntries, premergeCiEntries >= 2L);
+        assertEquals("pre-merge: OI must contain name+age for every CI file", premergeCiEntries * 2L, premergeOiEntries);
 
         // Force-merge to a single segment — old segment entries in the scoped cache are stale.
         Request fm = new Request("POST", "/" + INDEX_NAME + "/_forcemerge");
@@ -539,6 +543,8 @@ public class ScopedPageIndexCacheIT extends AnalyticsRestTestCase {
         assertExactCiEntries("post-merge: CI entries = 1 (1 merged file × age × rg)", 1L);
         // OI: 1 merged file × {col_0(name), age(col 1)} = 2 entries (down from 4)
         assertExactOiEntries("post-merge: OI entries = 2 (1 merged file × {col_0,age})", 2L);
+        assertTrue("force-merge must reduce CI entries", ciEntries(postmerge) < premergeCiEntries);
+        assertTrue("force-merge must reduce OI entries", oiEntries(postmerge) < premergeOiEntries);
     }
 
     // ── cross-index shared cache ──────────────────────────────────────────────
