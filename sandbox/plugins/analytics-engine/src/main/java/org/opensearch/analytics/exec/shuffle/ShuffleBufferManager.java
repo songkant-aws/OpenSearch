@@ -36,6 +36,8 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Per-node registry of shuffle buffers for hash-shuffle joins. One {@link ShuffleBuffer} per
@@ -52,7 +54,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>Each {@link ShuffleBuffer} tracks per-side sender completion via {@code CountDownLatch}es and
  * stores accepted chunks. On-heap budget enforcement is owned by the MANAGER, not the buffer:
  * {@link #tryAdmit} gates each chunk against a node-level + per-query byte budget (see
- * {@link #setBudgets}). The consumer calls {@link ShuffleBuffer#awaitReady} before draining.
+ * {@link #setBudgets}). A live consumer can start after either side has its first chunk (or EOF),
+ * then releases resident budget chunk-by-chunk while producers continue through a bounded queue.
  *
  * @opensearch.internal
  */
@@ -65,9 +68,10 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
     /**
      * Node-level on-heap shuffle budget and per-query footprints — the OOM-safety bound.
      *
-     * <p>The shuffle consumer is buffer-all-then-drain, so a node's live shuffle byte[] is the SUM
-     * of every buffer it holds across ALL queries/stages/partitions. A per-buffer cap can't bound
-     * that sum (N partitions each under the cap still OOM in aggregate), so admission is gated on:
+     * <p>The shuffle consumer releases chunks incrementally, but a slow or not-yet-started consumer
+     * can still accumulate them, so a node's live shuffle byte[] is the SUM of every buffer it holds
+     * across ALL queries/stages/partitions. A per-buffer cap can't bound that sum, so admission is
+     * gated on:
      * <ul>
      *   <li>{@link #nodeBudgetBytes} — hard ceiling on {@link #totalBytes} (all queries combined).
      *       When a chunk would push the node total past this AND the query itself still fits its
@@ -104,9 +108,10 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
      * breach the PER-QUERY on-heap budget, {@link #tryAdmit} evicts oldest in-memory chunks of the
      * target side to a per-(query,stage,partition,side) spill file under {@link #spillDir} instead of
      * throwing — so the on-heap footprint stays bounded by the budget while the rest lives on disk.
-     * The consumer drains spilled chunks back (in arrival order) then the in-memory tail, preserving
-     * the buffer-all contract. {@link #spillMaxBytes} is the hard disk ceiling across all of this
-     * node's spill files; hitting it (or a disk write I/O error) is the new terminal failure
+     * The consumer drains the sealed spilled prefix back in arrival order, then continues from a
+     * bounded live queue. Spill stops once live draining begins so a later spill cannot overtake an
+     * already queued chunk. {@link #spillMaxBytes} is the hard disk ceiling across all of this node's
+     * spill files; hitting it (or a disk write I/O error) is the new terminal failure
      * (re-messaged {@link ShuffleBufferExceededException}). All counter mutations on the spill path
      * stay under {@link #admitLock} (same accounting path as {@code releaseLocked}); the byte budget
      * then tracks ONLY the in-memory-resident bytes. {@link #spilledTotalBytes} is the node-wide
@@ -301,14 +306,22 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
                 key(queryId, targetStageId, partitionIndex),
                 k -> newBuffer(queryId, targetStageId, partitionIndex)
             );
-            // Defensive: NEVER append data to a buffer a consumer has begun draining — the drain
-            // snapshotted the in-memory tail, so this chunk would be silently dropped (lost rows).
-            // The producer's two-phase close (DatafusionPartitionedSink: drain all data sends before
-            // any isLast) makes this unreachable in the normal path, but a buggy/reordered late RPC
-            // must FAIL LOUD here rather than under-deliver. (codex round-5 BLOCKER #2.) Checked under
-            // admitLock, the same lock beginDrain flips `draining` under, so this read can't race a
-            // half-started drain.
-            if (buffer.isDraining()) {
+            if (buffer.isDiscarding(side)) {
+                // DataFusion ended this input early (for example LimitExec dropped the receiver).
+                // Acknowledge late producer chunks without storing/reserving them.
+                return AdmitResult.ACCEPTED;
+            }
+            if (buffer.isStreamFinished(side)) {
+                buffer.recordRejected();
+                throw new IllegalStateException(
+                    "Shuffle data arrived after completed " + side + " stream for " + key(queryId, targetStageId, partitionIndex)
+                );
+            }
+            // A sealed/snapshot drain cannot accept late data because its tail has already been
+            // copied. A live streaming drain deliberately can: addData wakes the blocking iterator,
+            // which removes and budget-releases each chunk as it is consumed. Both modes are ordered
+            // against this check by admitLock.
+            if (buffer.isDraining() && buffer.isStreaming(side) == false) {
                 buffer.recordRejected();
                 throw new IllegalStateException(
                     "Shuffle data ("
@@ -349,6 +362,10 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
                     // returns REJECT_RETRY and the producer retries — succeeding once the draining
                     // sibling's removeBuffer frees its budget. Self-correcting, never over-commits heap
                     // against a draining buffer. (codex review round-4 BLOCKER #1.)
+                    if (q.get() > 0 && q.get() + size > perQueryMaxBytes) {
+                        buffer.recordRejected();
+                        return AdmitResult.REJECT_RETRY;
+                    }
                 } else {
                     buffer.recordRejected();
                     // Hard: this query alone can't fit — waiting never helps. Fail fast, non-retryable.
@@ -377,6 +394,7 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
      */
     private ShuffleBuffer newBuffer(String queryId, int targetStageId, int partitionIndex) {
         ShuffleBuffer buffer = new ShuffleBuffer();
+        buffer.attachOwner(this, queryId);
         if (spillEnabled && spillDir != null) {
             buffer.enableSpill(this, spillDir, queryId, targetStageId, partitionIndex);
         }
@@ -603,6 +621,21 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
     }
 
     /**
+     * Releases one live-drained resident chunk from the node, query, and buffer accounting. The
+     * iterator removes the chunk from its queue before calling here; {@code releaseCurrentBytes}
+     * returns the amount still charged so a concurrent query clear cannot double-release it.
+     */
+    private void releaseConsumed(ShuffleBuffer buffer, long bytes) {
+        if (bytes <= 0 || buffer.ownerQueryId == null) {
+            return;
+        }
+        synchronized (admitLock) {
+            long released = buffer.releaseCurrentBytes(bytes);
+            releaseLocked(buffer.ownerQueryId, released);
+        }
+    }
+
+    /**
      * Removes every buffer belonging to {@code queryId} (all stages, all partitions on this node).
      * Each {@link ShuffleBuffer} holds the query's shuffled payload as on-heap {@code byte[]} lists;
      * without this the entries live for the JVM's lifetime and accumulate across queries → on-heap
@@ -750,6 +783,10 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
     public static class ShuffleBuffer implements ShuffleBufferAccess {
         private final List<byte[]> leftData = Collections.synchronizedList(new ArrayList<>());
         private final List<byte[]> rightData = Collections.synchronizedList(new ArrayList<>());
+        private final ReentrantLock leftDataLock = new ReentrantLock();
+        private final ReentrantLock rightDataLock = new ReentrantLock();
+        private final Condition leftReadable = leftDataLock.newCondition();
+        private final Condition rightReadable = rightDataLock.newCondition();
         private final AtomicInteger leftDoneCount = new AtomicInteger();
         private final AtomicInteger rightDoneCount = new AtomicInteger();
         private volatile int expectedLeftSenders = -1;
@@ -767,6 +804,7 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
          * (drain/cleanup), so the per-side fields need no further synchronization.
          */
         private ShuffleBufferManager owner;
+        private String ownerQueryId;
         private Path querySpillDir;
         private String spillKey; // <stageId>-<partition>
         private SpilledSide leftSpill;
@@ -782,8 +820,20 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
          * (codex review round-4 BLOCKER #1.) volatile so the spill path sees a set made under the lock.
          */
         private volatile boolean draining;
+        /** Per-side live-drain state: one side must never make a sibling snapshot drain appendable. */
+        private volatile boolean leftStreaming;
+        private volatile boolean rightStreaming;
+        private volatile boolean leftStreamFinished;
+        private volatile boolean rightStreamFinished;
+        private volatile boolean leftDiscarding;
+        private volatile boolean rightDiscarding;
 
         public ShuffleBuffer() {}
+
+        private void attachOwner(ShuffleBufferManager owner, String queryId) {
+            this.owner = owner;
+            this.ownerQueryId = queryId;
+        }
 
         /**
          * Wires this buffer's spill identity (lazy — no file is opened here). Once set, a per-query
@@ -818,10 +868,14 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
         public void addData(String side, byte[] data) {
             int size = data == null ? 0 : data.length;
             currentBytes.addAndGet(size);
-            if ("left".equals(side)) {
-                leftData.add(data);
-            } else {
-                rightData.add(data);
+            List<byte[]> target = "left".equals(side) ? leftData : rightData;
+            ReentrantLock dataLock = dataLockFor(side);
+            dataLock.lock();
+            try {
+                target.add(data);
+                readableConditionFor(side).signalAll();
+            } finally {
+                dataLock.unlock();
             }
         }
 
@@ -844,10 +898,14 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
          * IN-MEMORY-resident bytes, so a later {@link ShuffleBufferManager#removeBuffer} releases only
          * what is still resident — never the already-released spilled bytes (no double-release).
          */
-        void releaseCurrentBytes(long bytes) {
-            if (bytes > 0) {
-                currentBytes.accumulateAndGet(bytes, (cur, b) -> Math.max(0, cur - b));
+        long releaseCurrentBytes(long bytes) {
+            if (bytes <= 0) {
+                return 0L;
             }
+            long before = currentBytes.get();
+            long released = Math.min(before, bytes);
+            currentBytes.set(before - released);
+            return released;
         }
 
         /**
@@ -868,12 +926,15 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
                 return 0L;
             }
             List<byte[]> list = "left".equals(side) ? leftData : rightData;
+            ReentrantLock dataLock = dataLockFor(side);
             long evicted = 0L;
             while (evicted < targetBytes) {
                 byte[] chunk;
-                // synchronizedList: lock the list for the size-check + remove(0) so a concurrent
-                // addData (other side / other producer) can't shift indices under us.
-                synchronized (list) {
+                // Hold the side lock for the size-check + remove(0) so a concurrent producer cannot
+                // shift indices under us. The caller already holds admitLock, preserving the global
+                // admitLock -> side-lock ordering also used by live-consumer close.
+                dataLock.lock();
+                try {
                     if (list.isEmpty()) {
                         break;
                     }
@@ -888,6 +949,8 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
                         throw ShuffleBufferExceededException.forDiskCeiling(owner.getSpilledTotalBytes() + diskBytes, owner.spillMaxBytes);
                     }
                     list.remove(0);
+                } finally {
+                    dataLock.unlock();
                 }
                 int len = chunk == null ? 0 : chunk.length;
                 long diskBytes = len + SPILL_FRAME_HEADER_BYTES;
@@ -964,9 +1027,21 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
             if ("left".equals(side)) {
                 leftDoneCount.incrementAndGet();
                 checkCompletion("left");
+                signal("left");
             } else {
                 rightDoneCount.incrementAndGet();
                 checkCompletion("right");
+                signal("right");
+            }
+        }
+
+        private void signal(String side) {
+            ReentrantLock dataLock = dataLockFor(side);
+            dataLock.lock();
+            try {
+                readableConditionFor(side).signalAll();
+            } finally {
+                dataLock.unlock();
             }
         }
 
@@ -999,6 +1074,41 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
             return true;
         }
 
+        @Override
+        public boolean awaitReadable(String side, long timeoutMillis) throws InterruptedException {
+            List<byte[]> data = "left".equals(side) ? leftData : rightData;
+            ReentrantLock dataLock = dataLockFor(side);
+            Condition readable = readableConditionFor(side);
+            long remaining = TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+            dataLock.lockInterruptibly();
+            try {
+                while (data.isEmpty() && isSideComplete(side) == false) {
+                    if (remaining <= 0) {
+                        return false;
+                    }
+                    remaining = readable.awaitNanos(remaining);
+                }
+                return true;
+            } finally {
+                dataLock.unlock();
+            }
+        }
+
+        private ReentrantLock dataLockFor(String side) {
+            return "left".equals(side) ? leftDataLock : rightDataLock;
+        }
+
+        private Condition readableConditionFor(String side) {
+            return "left".equals(side) ? leftReadable : rightReadable;
+        }
+
+        private boolean isSideComplete(String side) {
+            if ("left".equals(side)) {
+                return expectedLeftSenders >= 0 && leftDoneCount.get() >= expectedLeftSenders;
+            }
+            return expectedRightSenders >= 0 && rightDoneCount.get() >= expectedRightSenders;
+        }
+
         /**
          * Marks this buffer as draining so the spill path stops touching it. Flips {@link #draining}
          * under the owner's {@code admitLock} (when an owner is wired) so the set is ordered against
@@ -1007,13 +1117,26 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
          * every drain entry point, BEFORE any list snapshot or spill-file open. A throwaway buffer
          * (no owner) just sets the flag. (codex review round-4 BLOCKER #1.)
          */
-        private void beginDrain() {
+        private void beginDrain(String side, boolean live) {
             if (owner != null) {
                 synchronized (owner.admitLock) {
                     draining = true;
+                    markStreaming(side, live);
                 }
             } else {
                 draining = true;
+                markStreaming(side, live);
+            }
+        }
+
+        private void markStreaming(String side, boolean live) {
+            if (live == false) {
+                return;
+            }
+            if ("left".equals(side)) {
+                leftStreaming = true;
+            } else {
+                rightStreaming = true;
             }
         }
 
@@ -1022,26 +1145,78 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
             return draining;
         }
 
+        boolean isStreaming(String side) {
+            return "left".equals(side) ? leftStreaming : rightStreaming;
+        }
+
+        boolean isStreamFinished(String side) {
+            return "left".equals(side) ? leftStreamFinished : rightStreamFinished;
+        }
+
+        boolean isDiscarding(String side) {
+            return "left".equals(side) ? leftDiscarding : rightDiscarding;
+        }
+
+        private void markStreamFinished(String side) {
+            if ("left".equals(side)) {
+                leftStreamFinished = true;
+            } else {
+                rightStreamFinished = true;
+            }
+        }
+
+        private void markDiscarding(String side) {
+            if ("left".equals(side)) {
+                leftDiscarding = true;
+            } else {
+                rightDiscarding = true;
+            }
+        }
+
         public List<byte[]> getLeftData() {
-            beginDrain();
-            return drainSide(leftSpill, leftData);
+            beginDrain("left", false);
+            return drainSide(leftSpill, leftData, leftDataLock);
         }
 
         public List<byte[]> getRightData() {
-            beginDrain();
-            return drainSide(rightSpill, rightData);
+            beginDrain("right", false);
+            return drainSide(rightSpill, rightData, rightDataLock);
         }
 
         @Override
         public CloseableIterator<byte[]> drainLeft() {
-            beginDrain();
-            return drainSideLazy(leftSpill, leftData);
+            beginDrain("left", false);
+            return drainSideLazy(leftSpill, leftData, leftDataLock);
         }
 
         @Override
         public CloseableIterator<byte[]> drainRight() {
-            beginDrain();
-            return drainSideLazy(rightSpill, rightData);
+            beginDrain("right", false);
+            return drainSideLazy(rightSpill, rightData, rightDataLock);
+        }
+
+        @Override
+        public CloseableIterator<byte[]> streamLeft(long idleTimeoutMillis) {
+            beginDrain("left", true);
+            return streamSide(leftSpill, leftData, "left", leftDataLock, leftReadable, idleTimeoutMillis);
+        }
+
+        @Override
+        public CloseableIterator<byte[]> streamRight(long idleTimeoutMillis) {
+            beginDrain("right", true);
+            return streamSide(rightSpill, rightData, "right", rightDataLock, rightReadable, idleTimeoutMillis);
+        }
+
+        private CloseableIterator<byte[]> streamSide(
+            SpilledSide spill,
+            List<byte[]> inMemory,
+            String side,
+            ReentrantLock dataLock,
+            Condition readable,
+            long idleTimeoutMillis
+        ) {
+            LiveSideIterator live = new LiveSideIterator(inMemory, side, dataLock, readable, idleTimeoutMillis);
+            return spill == null ? live : new SpillThenLiveIterator(spill, live);
         }
 
         /**
@@ -1054,12 +1229,15 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
          * <p>Runs once per side after {@link #awaitReady}; the buffer is fully populated and no longer
          * mutated, so a snapshot of the in-memory tail taken under its monitor is stable.
          */
-        private static CloseableIterator<byte[]> drainSideLazy(SpilledSide spill, List<byte[]> inMemory) {
+        private static CloseableIterator<byte[]> drainSideLazy(SpilledSide spill, List<byte[]> inMemory, ReentrantLock dataLock) {
             // Snapshot the in-memory tail once (drain is single-threaded post awaitReady, but addData
             // used a synchronizedList, so honor its monitor for safe publication).
             final List<byte[]> tail;
-            synchronized (inMemory) {
+            dataLock.lock();
+            try {
                 tail = new ArrayList<>(inMemory);
+            } finally {
+                dataLock.unlock();
             }
             if (spill == null) {
                 // No spill for this side: just iterate the heap-resident tail, nothing to close.
@@ -1093,7 +1271,7 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
          * acceptable. A spill read error surfaces as an {@link UncheckedIOException} that fails the
          * fragment (correctness over silent under-delivery).
          */
-        private static List<byte[]> drainSide(SpilledSide spill, List<byte[]> inMemory) {
+        private static List<byte[]> drainSide(SpilledSide spill, List<byte[]> inMemory, ReentrantLock dataLock) {
             if (spill == null) {
                 return inMemory;
             }
@@ -1103,8 +1281,11 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
                 combined.addAll(spilled);
                 // Snapshot the in-memory tail under its monitor — drain is single-threaded post
                 // awaitReady, but addData uses a synchronizedList so honor its lock.
-                synchronized (inMemory) {
+                dataLock.lock();
+                try {
                     combined.addAll(inMemory);
+                } finally {
+                    dataLock.unlock();
                 }
                 return combined;
             } catch (IOException e) {
@@ -1126,6 +1307,188 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
 
         public int getRightDoneCount() {
             return rightDoneCount.get();
+        }
+
+        /** Blocking live queue used once a worker starts consuming before producer completion. */
+        private final class LiveSideIterator implements CloseableIterator<byte[]> {
+            private final List<byte[]> data;
+            private final String side;
+            private final ReentrantLock dataLock;
+            private final Condition readable;
+            private final long idleTimeoutNanos;
+            private volatile boolean closed;
+
+            LiveSideIterator(List<byte[]> data, String side, ReentrantLock dataLock, Condition readable, long idleTimeoutMillis) {
+                this.data = data;
+                this.side = side;
+                this.dataLock = dataLock;
+                this.readable = readable;
+                this.idleTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(idleTimeoutMillis);
+            }
+
+            @Override
+            public boolean hasNext() {
+                long remaining = idleTimeoutNanos;
+                dataLock.lock();
+                try {
+                    while (closed == false && data.isEmpty() && isSideComplete(side) == false) {
+                        if (remaining <= 0) {
+                            throw new IllegalStateException(
+                                "Timed out waiting for live shuffle "
+                                    + side
+                                    + " data after "
+                                    + TimeUnit.NANOSECONDS.toMillis(idleTimeoutNanos)
+                                    + "ms"
+                            );
+                        }
+                        try {
+                            remaining = readable.awaitNanos(remaining);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            throw new IllegalStateException("Interrupted while waiting for live shuffle " + side + " data", e);
+                        }
+                    }
+                    boolean hasNext = closed == false && data.isEmpty() == false;
+                    if (hasNext == false && closed == false && isSideComplete(side)) {
+                        markStreamFinished(side);
+                    }
+                    return hasNext;
+                } finally {
+                    dataLock.unlock();
+                }
+            }
+
+            @Override
+            public byte[] next() {
+                if (hasNext() == false) {
+                    throw new NoSuchElementException();
+                }
+                byte[] chunk;
+                dataLock.lock();
+                try {
+                    chunk = data.remove(0);
+                } finally {
+                    dataLock.unlock();
+                }
+                if (owner != null && chunk != null) {
+                    owner.releaseConsumed(ShuffleBuffer.this, chunk.length);
+                }
+                return chunk;
+            }
+
+            @Override
+            public void close() {
+                if (owner != null) {
+                    synchronized (owner.admitLock) {
+                        closeAndDiscard();
+                    }
+                } else {
+                    closeAndDiscard();
+                }
+            }
+
+            private void closeAndDiscard() {
+                if (isStreamFinished(side) == false) {
+                    markDiscarding(side);
+                }
+                closed = true;
+                long discardedBytes = 0L;
+                dataLock.lock();
+                try {
+                    for (byte[] chunk : data) {
+                        discardedBytes += chunk == null ? 0 : chunk.length;
+                    }
+                    data.clear();
+                    readable.signalAll();
+                } finally {
+                    dataLock.unlock();
+                }
+                if (owner != null) {
+                    owner.releaseConsumed(ShuffleBuffer.this, discardedBytes);
+                }
+            }
+        }
+
+        /** Streams the already-spilled prefix, then switches to the live resident queue. */
+        private static final class SpillThenLiveIterator implements CloseableIterator<byte[]> {
+            private DataInputStream in;
+            private final LiveSideIterator live;
+            private final Path spillPath;
+            private byte[] nextChunk;
+            private boolean nextLoaded;
+
+            SpillThenLiveIterator(SpilledSide spill, LiveSideIterator live) {
+                this.live = live;
+                this.spillPath = spill.path();
+                try {
+                    this.in = spill.openForRead();
+                } catch (IOException e) {
+                    throw new UncheckedIOException("Failed to open shuffle spill file " + spillPath, e);
+                }
+            }
+
+            @Override
+            public boolean hasNext() {
+                if (nextLoaded) {
+                    return true;
+                }
+                if (in != null) {
+                    nextChunk = readNextChunk();
+                    if (nextChunk != null) {
+                        nextLoaded = true;
+                        return true;
+                    }
+                    closeSpill();
+                }
+                return live.hasNext();
+            }
+
+            @Override
+            public byte[] next() {
+                if (hasNext() == false) {
+                    throw new NoSuchElementException();
+                }
+                if (nextLoaded) {
+                    byte[] chunk = nextChunk;
+                    nextChunk = null;
+                    nextLoaded = false;
+                    return chunk;
+                }
+                return live.next();
+            }
+
+            private byte[] readNextChunk() {
+                try {
+                    int len;
+                    try {
+                        len = in.readInt();
+                    } catch (EOFException eof) {
+                        return null;
+                    }
+                    byte[] chunk = new byte[len];
+                    in.readFully(chunk);
+                    return chunk;
+                } catch (IOException e) {
+                    throw new UncheckedIOException("Failed to read back shuffle spill file " + spillPath, e);
+                }
+            }
+
+            private void closeSpill() {
+                if (in != null) {
+                    try {
+                        in.close();
+                    } catch (IOException e) {
+                        LOGGER.debug(new ParameterizedMessage("Failed to close shuffle spill read stream {}", spillPath), e);
+                    }
+                    in = null;
+                }
+            }
+
+            @Override
+            public void close() {
+                closeSpill();
+                live.close();
+            }
         }
 
         /**

@@ -88,11 +88,11 @@ public final class AnalyticsSettings {
     );
 
     /**
-     * Per-partition receive timeout for hash-shuffle consumers. Each consumer task blocks on
-     * its {@code ShuffleBuffer} until both producer sides signal {@code isLast}; if no senders
-     * complete within this timeout, the partition fails and the query terminates. The timeout
-     * is a backstop against stuck producers (cancelled queries cascade through the walker
-     * faster than this); 60s is conservative enough that healthy queries never hit it.
+     * Per-partition idle timeout for hash-shuffle consumers. Each side waits for its first chunk
+     * (or sender EOF), then applies the same timeout whenever its live queue is empty while producers
+     * remain active. The timeout is a backstop against stuck producers (cancelled queries cascade
+     * through the walker faster than this); 60s is conservative enough that healthy queries never
+     * hit it.
      */
     public static final Setting<TimeValue> MPP_SHUFFLE_RECV_TIMEOUT = Setting.timeSetting(
         "analytics.mpp.shuffle.recv_timeout",
@@ -105,13 +105,12 @@ public final class AnalyticsSettings {
     /**
      * Node-level on-heap hash-shuffle budget, as a PERCENT of the JVM max heap ({@code -Xmx}).
      *
-     * <p>The shuffle consumer is buffer-all-then-drain: a worker blocks on
-     * {@code ShuffleBuffer.awaitReady} until both producer sides finish, then drains the accumulated
-     * Arrow-IPC {@code byte[]} chunks. Those chunks live ON the JVM heap, and a node's live shuffle
-     * bytes are the SUM across every buffer it holds (all queries/stages/partitions). Without a bound
-     * a large shuffle accumulates its whole input on-heap and OOMs the node (observed: 7.4 GB of
-     * {@code byte[]} on an 8 GB heap for TPC-H q17 at sf=10). A PER-BUFFER cap can't bound the sum
-     * (N partitions each under the cap still OOM in aggregate), so the budget is per-NODE.
+     * <p>Shuffle Arrow-IPC {@code byte[]} chunks live ON the JVM heap until their consumer hands them
+     * to the native input stream. The consumer now releases each resident chunk incrementally, but a
+     * slow or not-yet-started consumer can still accumulate data; a node's live shuffle bytes are the
+     * SUM across every buffer it holds (all queries/stages/partitions). Without a bound a large shuffle
+     * can OOM the node (observed: 7.4 GB of {@code byte[]} on an 8 GB heap for TPC-H q17 at sf=10). A
+     * PER-BUFFER cap can't bound that sum, so the budget is per-NODE.
      *
      * <p>{@code ShuffleBufferManager} admits a chunk only if the node total stays under
      * {@code percent% × maxHeap}; over-budget admissions are rejected for retry (room frees when
@@ -243,8 +242,9 @@ public final class AnalyticsSettings {
      * (see {@code ShuffleBufferManager.spillOldest}) instead of failing fast with
      * {@code ShuffleBufferExceededException}. This lets multi-GB shuffle intermediates (TPC-H q5/q10
      * at sf=10) RUN: the per-query on-heap footprint is bounded by the budget, the rest lives on disk,
-     * and the consumer drains spilled chunks back (in arrival order) followed by the in-memory tail —
-     * preserving the proven buffer-all consumer contract.
+     * and the consumer drains the spilled prefix back in arrival order before continuing from the
+     * bounded live queue. Once live draining starts, producers use queue backpressure instead of
+     * appending more spill frames, so ordering remains deterministic across the spill/live boundary.
      *
      * <p>When {@code false} (default), behavior is byte-identical to the pre-spill fail-fast path: a
      * per-query budget breach still throws {@code ShuffleBufferExceededException}. The node-budget

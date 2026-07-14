@@ -8,12 +8,6 @@
 
 package org.opensearch.be.datafusion;
 
-import org.apache.arrow.c.ArrowArray;
-import org.apache.arrow.c.ArrowSchema;
-import org.apache.arrow.c.Data;
-import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.analytics.backend.ShardScanExecutionContext;
@@ -26,8 +20,6 @@ import org.opensearch.analytics.spi.ShuffleBufferRegistry;
 import org.opensearch.analytics.spi.ShuffleScanInstructionNode;
 import org.opensearch.be.datafusion.nativelib.NativeBridge;
 
-import java.io.ByteArrayInputStream;
-
 /**
  * Handler for {@link ShuffleScanInstructionNode} on a hash-shuffle worker.
  *
@@ -38,10 +30,9 @@ import java.io.ByteArrayInputStream;
  * partitioned stream.
  *
  * <p>The handler runs synchronously on the data-node executor thread that processes the
- * fragment's instruction list. {@link ShuffleBufferAccess#awaitReady} blocks here until both
- * left and right producers have all reported {@code isLast} for this partition, then the
- * handler drains the buffer's accumulated IPC chunks for the {@code "left"} or {@code "right"}
- * side (the named-input id encodes which) and pushes each batch into the native sender.
+ * fragment's instruction list. It waits only until its side has a first chunk (or reaches EOF),
+ * then live-drains later chunks while producers are still running and pushes each IPC chunk into
+ * the native sender. Rust performs IPC decode directly into the bounded DataFusion input channel.
  *
  * <p>Chain-ordering requirement: same as {@link BroadcastInjectionHandler} — must run AFTER
  * {@link ShardScanInstructionHandler} so the {@code SessionContextHandle} exists. The
@@ -64,9 +55,9 @@ public class ShuffleScanHandler implements FragmentInstructionHandler<ShuffleSca
 
     private static final Logger LOGGER = LogManager.getLogger(ShuffleScanHandler.class);
 
-    /** Cap on how long the consumer waits for both producer sides to mark {@code isLast}.
-     *  Real producers complete within milliseconds on a healthy cluster — the cap exists
-     *  solely as a backstop against stuck producers (cancelled queries cascade through the
+    /** Cap on how long the consumer waits for a side's first chunk/EOF and for each subsequent
+     *  empty-queue interval while producers remain active. The cap exists solely as a backstop
+     *  against stuck producers (cancelled queries cascade through the
      *  walker faster than this). Operator-tuneable via {@code analytics.mpp.shuffle.recv_timeout}
      *  once that cluster setting is plumbed into {@link ShardScanExecutionContext}; today the
      *  handler reads the JVM system property of the same name as a stopgap so integration
@@ -135,15 +126,11 @@ public class ShuffleScanHandler implements FragmentInstructionHandler<ShuffleSca
                 side,
                 node.getExpectedSenders()
             );
-            // Block here until BOTH sides' producers have all reported isLast for this partition.
-            // The buffer's awaitReady gates on left-and-right because the handler runs once for
-            // each side; both invocations agree the buffer is fully populated before either
-            // returns. The current handler still drains only its own side, but we must wait for
-            // both because the producer-side dispatch fires concurrently and the IPC bytes for
-            // the not-yet-arrived side are racing in the same buffer.
-            if (!buffer.awaitReady(DEFAULT_AWAIT_READY_TIMEOUT_MS)) {
+            // Wait only for this side's first chunk or EOF. The live iterator below continues to
+            // wait for later chunks, so DataFusion can build/consume while transport is in flight.
+            if (!buffer.awaitReadable(side, DEFAULT_AWAIT_READY_TIMEOUT_MS)) {
                 throw new RuntimeException(
-                    "ShuffleScanHandler: timed out waiting for shuffle producers to finish for "
+                    "ShuffleScanHandler: timed out waiting for shuffle input to become readable for "
                         + inputId
                         + " (timeout="
                         + DEFAULT_AWAIT_READY_TIMEOUT_MS
@@ -158,8 +145,9 @@ public class ShuffleScanHandler implements FragmentInstructionHandler<ShuffleSca
         // LAZY drain: pull chunks one at a time. With spill, only ONE chunk is heap-resident at a
         // time — the rest stream from the spill file — so an over-budget partition drains without
         // re-materializing (the whole point of disk spill). The iterator owns the spill-file handle.
-        BufferAllocator alloc = shardCtx.getAllocator();
-        CloseableIterator<byte[]> chunks = isLeftSide ? buffer.drainLeft() : buffer.drainRight();
+        CloseableIterator<byte[]> chunks = isLeftSide
+            ? buffer.streamLeft(DEFAULT_AWAIT_READY_TIMEOUT_MS)
+            : buffer.streamRight(DEFAULT_AWAIT_READY_TIMEOUT_MS);
 
         // Peek the first chunk for the schema (one chunk in heap is fine). No first chunk → empty
         // partition: register an empty memtable and return. Close the iterator on every path here.
@@ -236,11 +224,10 @@ public class ShuffleScanHandler implements FragmentInstructionHandler<ShuffleSca
             } else {
                 // Join-shuffle: schema from the first chunk's IPC header (producer ships raw rows whose
                 // names already match the consumer's expected input — no re-lowering needed).
-                byte[] schemaIpc = extractSchemaIpc(firstChunk, alloc);
                 senderPtr = NativeBridge.registerPartitionStreamOnSessionContext(
                     sessionState.sessionContextHandle().getPointer(),
                     inputId,
-                    schemaIpc
+                    firstChunk
                 );
             }
         } catch (Exception e) {
@@ -262,19 +249,17 @@ public class ShuffleScanHandler implements FragmentInstructionHandler<ShuffleSca
         final CloseableIterator<byte[]> chunkIter = chunks;
         final DatafusionPartitionSender finalSender = sender;
         Thread drainThread = new Thread(() -> {
-            int totalBatches = 0;
             int chunkCount = 0;
             Throwable drainFailure = null;
             try {
-                totalBatches += pumpChunkIntoSender(firstChunkFinal, alloc, finalSender);
+                finalSender.sendIpc(firstChunkFinal);
                 chunkCount++;
-                while (chunkIter.hasNext()) {
-                    totalBatches += pumpChunkIntoSender(chunkIter.next(), alloc, finalSender);
+                while (finalSender.isReceiverDropped() == false && chunkIter.hasNext()) {
+                    finalSender.sendIpc(chunkIter.next());
                     chunkCount++;
                 }
                 LOGGER.debug(
-                    "ShuffleScanHandler.drain: drained {} batches across {} chunks for {} (side={}, partition={})",
-                    totalBatches,
+                    "ShuffleScanHandler.drain: drained {} native IPC chunks for {} (side={}, partition={})",
                     chunkCount,
                     inputId,
                     side,
@@ -315,77 +300,4 @@ public class ShuffleScanHandler implements FragmentInstructionHandler<ShuffleSca
         return backendContext;
     }
 
-    /**
-     * Reads the schema header from an Arrow IPC stream chunk and returns an isolated
-     * IPC-stream blob containing only that schema. The returned bytes are the same shape
-     * {@link ArrowSchemaIpc#toBytes} produces — what
-     * {@link NativeBridge#registerPartitionStreamOnSessionContext} expects.
-     */
-    private static byte[] extractSchemaIpc(byte[] chunkIpc, BufferAllocator alloc) throws Exception {
-        // Pass the compression factory so a producer-compressed chunk decodes; the reader
-        // auto-detects the codec (incl. NO_COMPRESSION) from the IPC message metadata.
-        try (
-            ByteArrayInputStream in = new ByteArrayInputStream(chunkIpc);
-            ArrowStreamReader reader = new ArrowStreamReader(in, alloc, ShuffleCompression.FACTORY)
-        ) {
-            return ArrowSchemaIpc.toBytes(reader.getVectorSchemaRoot().getSchema());
-        }
-    }
-
-    /**
-     * Decodes every batch in {@code chunkIpc} and pushes each into the native sender via Arrow
-     * C Data Interface. Returns the batch count for logging.
-     */
-    private static int pumpChunkIntoSender(byte[] chunkIpc, BufferAllocator alloc, DatafusionPartitionSender sender) throws Exception {
-        int count = 0;
-        try (
-            ByteArrayInputStream in = new ByteArrayInputStream(chunkIpc);
-            ArrowStreamReader reader = new ArrowStreamReader(in, alloc, ShuffleCompression.FACTORY)
-        ) {
-            VectorSchemaRoot rootView = reader.getVectorSchemaRoot();
-            while (reader.loadNextBatch()) {
-                // Each loadNextBatch mutates rootView in-place. Export immediately; the native
-                // sender takes ownership of the FFI structs on success.
-                ArrowArray array = ArrowArray.allocateNew(alloc);
-                ArrowSchema arrowSchema = ArrowSchema.allocateNew(alloc);
-                boolean handedOff = false;
-                try {
-                    Data.exportVectorSchemaRoot(alloc, rootView, null, array, arrowSchema);
-                    sender.send(array.memoryAddress(), arrowSchema.memoryAddress());
-                    handedOff = true;
-                    count++;
-                } finally {
-                    // On success Rust released the underlying FFI structs (the release callback
-                    // is nulled); on failure we own them and must close. Java-side close is safe
-                    // either way — close on a hand-off-d wrapper is a no-op.
-                    if (!handedOff) {
-                        try {
-                            array.close();
-                        } catch (Throwable ignore) {
-                            // best-effort — primary error is being surfaced
-                        }
-                        try {
-                            arrowSchema.close();
-                        } catch (Throwable ignore) {
-                            // best-effort — primary error is being surfaced
-                        }
-                    } else {
-                        // Always close the Java wrappers' tracking state. Native already owns
-                        // the underlying memory.
-                        try {
-                            array.close();
-                        } catch (Throwable ignore) {
-                            // best-effort
-                        }
-                        try {
-                            arrowSchema.close();
-                        } catch (Throwable ignore) {
-                            // best-effort
-                        }
-                    }
-                }
-            }
-        }
-        return count;
-    }
 }

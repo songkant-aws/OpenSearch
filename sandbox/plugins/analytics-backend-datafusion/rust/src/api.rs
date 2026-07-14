@@ -2152,6 +2152,37 @@ pub unsafe fn sender_send(
     Ok(sender.send_blocking(Ok(batch), io_handle))
 }
 
+/// Decodes one self-contained Arrow IPC stream chunk in Rust and pushes all of its batches into
+/// the partition channel. This is the shuffle-consumer fast path: transport still delivers bytes
+/// through Java, but decoding no longer round-trips through Arrow Java and the C Data interface.
+pub unsafe fn sender_send_ipc(
+    sender_ptr: i64,
+    ipc_bytes: &[u8],
+    io_handle: &tokio::runtime::Handle,
+) -> Result<crate::partition_stream::SendOutcome, DataFusionError> {
+    use arrow::ipc::reader::StreamReader;
+    use std::io::Cursor;
+
+    let sender = &*(sender_ptr as *const PartitionStreamSender);
+    let reader = StreamReader::try_new(Cursor::new(ipc_bytes), None).map_err(|e| {
+        DataFusionError::Execution(format!("Failed to open shuffle IPC stream: {e}"))
+    })?;
+    for batch in reader {
+        let mut batch = batch.map_err(|e| {
+            DataFusionError::Execution(format!("Failed to decode shuffle IPC batch: {e}"))
+        })?;
+        batch = conform_batch_to_schema(batch, sender.schema())?;
+        let outcome = sender.send_blocking(Ok(batch), io_handle);
+        if matches!(
+            outcome,
+            crate::partition_stream::SendOutcome::ReceiverDropped
+        ) {
+            return Ok(outcome);
+        }
+    }
+    Ok(crate::partition_stream::SendOutcome::Sent)
+}
+
 /// Conforms a producer batch to the consumer-side `StreamingTable`'s `declared`
 /// schema, but ONLY for the Utf8/Utf8View string-view family — the one divergence
 /// that is a genuine buffer-layout mismatch (offset buffers vs. view buffers) that
@@ -2917,6 +2948,42 @@ mod tests {
         let out = super::conform_batch_to_schema(batch, &declared).unwrap();
         // Matching column keeps its original Arc (no copy).
         assert!(Arc::ptr_eq(out.column(0), &col));
+    }
+
+    #[test]
+    fn sender_send_ipc_decodes_directly_into_partition_stream() {
+        use arrow::ipc::writer::StreamWriter;
+        use futures::StreamExt;
+
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![10, 20, 30]))],
+        )
+        .unwrap();
+        let mut ipc = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut ipc, schema.as_ref()).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let (sender, mut receiver) = crate::partition_stream::channel(Arc::clone(&schema));
+        let sender_ptr = Box::into_raw(Box::new(sender)) as i64;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = unsafe { super::sender_send_ipc(sender_ptr, &ipc, runtime.handle()) }.unwrap();
+        assert!(matches!(outcome, crate::partition_stream::SendOutcome::Sent));
+        unsafe { super::sender_close(sender_ptr) };
+
+        let decoded = runtime
+            .block_on(async { receiver.next().await.unwrap().unwrap() });
+        assert_eq!(decoded.num_rows(), 3);
+        assert_eq!(decoded.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(2), 30);
+        assert!(runtime.block_on(async { receiver.next().await }).is_none());
     }
 
     #[test]

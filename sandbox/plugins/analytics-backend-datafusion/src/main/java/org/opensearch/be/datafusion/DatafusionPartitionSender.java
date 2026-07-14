@@ -67,6 +67,20 @@ public final class DatafusionPartitionSender extends NativeHandle {
         }
     }
 
+    /** Sends all batches in one Arrow IPC stream chunk through the native decoder. */
+    public long sendIpc(byte[] ipcBytes) {
+        lifecycle.readLock().lock();
+        try {
+            long rc = NativeBridge.senderSendIpc(getPointer(), ipcBytes);
+            if (rc == NativeBridge.SENDER_SEND_RECEIVER_DROPPED) {
+                receiverDropped = true;
+            }
+            return rc;
+        } finally {
+            lifecycle.readLock().unlock();
+        }
+    }
+
     /** True once the consumer dropped this channel's receiver (see {@link #receiverDropped}). */
     public boolean isReceiverDropped() {
         return receiverDropped;

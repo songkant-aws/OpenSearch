@@ -119,6 +119,7 @@ public final class NativeBridge {
     private static final MethodHandle REGISTER_PARTITION_STREAM;
     private static final MethodHandle EXECUTE_LOCAL_PLAN;
     private static final MethodHandle SENDER_SEND;
+    private static final MethodHandle SENDER_SEND_IPC;
     private static final MethodHandle SENDER_CLOSE;
     private static final MethodHandle SENDER_FAIL;
     private static final MethodHandle REGISTER_MEMTABLE;
@@ -365,6 +366,12 @@ public final class NativeBridge {
         SENDER_SEND = linker.downcallHandle(
             lib.find("df_sender_send").orElseThrow(),
             FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG)
+        );
+
+        // i64 df_sender_send_ipc(sender_ptr, ipc_ptr, ipc_len)
+        SENDER_SEND_IPC = linker.downcallHandle(
+            lib.find("df_sender_send_ipc").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG)
         );
 
         // void df_sender_close(sender_ptr)
@@ -1419,6 +1426,20 @@ public final class NativeBridge {
         }
         try (var call = new NativeCall()) {
             return call.invoke(SENDER_SEND, senderPtr, arrayPtr, schemaPtr);
+        }
+    }
+
+    /**
+     * Pushes every batch in one self-contained Arrow IPC stream chunk into the native sender. IPC
+     * decode happens in Rust, avoiding the shuffle consumer's Arrow-Java decode and C Data export.
+     */
+    public static long senderSendIpc(long senderPtr, byte[] ipcBytes) {
+        NativeHandle.validatePointer(senderPtr, "sender");
+        if (ipcBytes == null || ipcBytes.length == 0) {
+            throw new IllegalArgumentException("ipcBytes must be non-empty");
+        }
+        try (var call = new NativeCall()) {
+            return call.invoke(SENDER_SEND_IPC, senderPtr, call.bytes(ipcBytes), (long) ipcBytes.length);
         }
     }
 

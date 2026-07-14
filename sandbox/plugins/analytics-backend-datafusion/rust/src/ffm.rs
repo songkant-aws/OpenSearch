@@ -759,6 +759,22 @@ pub unsafe extern "C" fn df_sender_send(sender_ptr: i64, array_ptr: i64, schema_
         .map_err(|e| e.to_string())
 }
 
+/// Native Arrow-IPC ingestion for shuffle consumers. The payload is a complete IPC stream chunk;
+/// Rust decodes and feeds every contained batch directly into the bounded partition channel.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_sender_send_ipc(
+    sender_ptr: i64,
+    ipc_ptr: *const u8,
+    ipc_len: i64,
+) -> i64 {
+    let mgr = get_rt_manager()?;
+    let ipc = slice::from_raw_parts(ipc_ptr, ipc_len as usize);
+    api::sender_send_ipc(sender_ptr, ipc, mgr.io_runtime.handle())
+        .map(send_outcome_to_code)
+        .map_err(|e| e.to_string())
+}
+
 /// Maps a send outcome to the `df_sender_send` return code: normal send `0`, dropped receiver
 /// [`SENDER_SEND_RECEIVER_DROPPED`] so the Java side can latch early-termination.
 fn send_outcome_to_code(outcome: crate::partition_stream::SendOutcome) -> i64 {

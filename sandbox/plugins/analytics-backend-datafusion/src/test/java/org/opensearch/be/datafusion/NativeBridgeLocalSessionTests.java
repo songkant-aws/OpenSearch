@@ -14,6 +14,7 @@ import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowStreamWriter;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
@@ -30,6 +31,7 @@ import org.apache.calcite.sql.type.SqlTypeName;
 import org.opensearch.be.datafusion.nativelib.NativeBridge;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.io.ByteArrayOutputStream;
 import java.nio.file.Path;
 import java.util.List;
 
@@ -120,6 +122,42 @@ public class NativeBridgeLocalSessionTests extends OpenSearchTestCase {
                 assertNotNull("schema IPC bytes returned", registered.schemaIpc());
                 assertTrue("schema IPC non-empty", registered.schemaIpc().length > 0);
                 NativeBridge.senderClose(registered.pointer());
+            } finally {
+                session.close();
+            }
+        } finally {
+            runtimeHandle.close();
+        }
+    }
+
+    public void testSenderSendIpcUsesNativeDecoder() throws Exception {
+        NativeRuntimeHandle runtimeHandle = createRuntime();
+        try (RootAllocator alloc = new RootAllocator(Long.MAX_VALUE)) {
+            DatafusionLocalSession session = new DatafusionLocalSession(runtimeHandle.get());
+            try {
+                NativeBridge.RegisteredInput registered = NativeBridge.registerPartitionStream(
+                    session.getPointer(),
+                    "input-0",
+                    passthroughSubstrait("input-0")
+                );
+                Schema schema = new Schema(List.of(new Field("x", FieldType.nullable(new ArrowType.Int(64, true)), null)));
+                try (
+                    VectorSchemaRoot vsr = VectorSchemaRoot.create(schema, alloc);
+                    ByteArrayOutputStream out = new ByteArrayOutputStream();
+                    ArrowStreamWriter writer = new ArrowStreamWriter(vsr, null, out);
+                    DatafusionPartitionSender sender = new DatafusionPartitionSender(registered.pointer())
+                ) {
+                    vsr.allocateNew();
+                    BigIntVector col = (BigIntVector) vsr.getVector(0);
+                    col.setSafe(0, 10L);
+                    col.setSafe(1, 20L);
+                    col.setValueCount(2);
+                    vsr.setRowCount(2);
+                    writer.start();
+                    writer.writeBatch();
+                    writer.end();
+                    assertEquals(0L, sender.sendIpc(out.toByteArray()));
+                }
             } finally {
                 session.close();
             }

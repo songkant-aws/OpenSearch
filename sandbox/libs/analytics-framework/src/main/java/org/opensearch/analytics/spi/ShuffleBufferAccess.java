@@ -18,8 +18,8 @@ import java.util.List;
  * <p>The implementing class lives in analytics-engine ({@code ShuffleBufferManager.ShuffleBuffer});
  * the SPI exposes only the consumer-side surface so backend handlers don't need a hard
  * dependency on the engine plugin's internals. Producers populate the buffer via the
- * {@code AnalyticsShuffleDataAction} transport path; consumers (this interface's caller)
- * await readiness, then drain.
+ * {@code AnalyticsShuffleDataAction} transport path; consumers (this interface's caller) can wait
+ * for one side to become readable and then drain it while later chunks are still arriving.
  *
  * @opensearch.internal
  */
@@ -42,6 +42,16 @@ public interface ShuffleBufferAccess {
      */
     boolean awaitReady(long timeoutMillis) throws InterruptedException;
 
+    /**
+     * Blocks until {@code side} has at least one chunk available or all of that side's senders have
+     * completed. Unlike {@link #awaitReady(long)}, this does not wait for the other side and therefore
+     * lets a worker register and start consuming each DataFusion input while producers are still
+     * shipping later chunks. Returns {@code false} on timeout.
+     */
+    default boolean awaitReadable(String side, long timeoutMillis) throws InterruptedException {
+        return awaitReady(timeoutMillis);
+    }
+
     /** Returns the accumulated Arrow IPC chunks for the {@code "left"} side. Caller must not mutate.
      *  <p>EAGER: with spill enabled this reads the whole partition (spilled file + in-memory tail)
      *  back into heap at once. Prefer {@link #drainLeft()} on the consumer hot path so a spilled
@@ -58,7 +68,7 @@ public interface ShuffleBufferAccess {
      * sender and discards it before pulling the next, so a spilled partition is never fully resident
      * in heap (this is what lets an over-budget shuffle RUN rather than OOM during drain).
      *
-     * <p>Call once per side after {@link #awaitReady}. MUST be closed (try-with-resources) so the
+     * <p>Call once per side after {@link #awaitReady(long)}. MUST be closed (try-with-resources) so the
      * spill-file handle is released even on partial iteration. The default wraps {@link #getLeftData()}
      * for implementations that hold everything in memory anyway.
      */
@@ -69,6 +79,21 @@ public interface ShuffleBufferAccess {
     /** LAZILY drains the {@code "right"} side — see {@link #drainLeft()}. */
     default CloseableIterator<byte[]> drainRight() {
         return wrap(getRightData().iterator());
+    }
+
+    /**
+     * Incrementally drains the left side while its producers are still active. The iterator blocks
+     * for at most {@code idleTimeoutMillis} whenever the live queue is empty, resumes when a producer
+     * appends a chunk, and ends only after every left sender completed and the queue is empty.
+     * Implementations without live-drain support retain the sealed {@link #drainLeft()} behavior.
+     */
+    default CloseableIterator<byte[]> streamLeft(long idleTimeoutMillis) {
+        return drainLeft();
+    }
+
+    /** Incremental right-side sibling of {@link #streamLeft(long)}. */
+    default CloseableIterator<byte[]> streamRight(long idleTimeoutMillis) {
+        return drainRight();
     }
 
     /** Adapts a plain {@link Iterator} to a no-op-close {@link CloseableIterator} (in-memory case). */

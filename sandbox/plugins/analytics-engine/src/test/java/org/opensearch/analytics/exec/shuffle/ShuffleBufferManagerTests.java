@@ -764,6 +764,100 @@ public class ShuffleBufferManagerTests extends OpenSearchTestCase {
         senderThread.join(1_000);
     }
 
+    public void testAwaitReadableDoesNotWaitForOtherSideOrEof() throws Exception {
+        ShuffleBufferManager mgr = new ShuffleBufferManager();
+        mgr.setBudgets(1_000, 1_000);
+        ShuffleBufferManager.ShuffleBuffer buffer = mgr.getOrCreateBuffer("q1", 0, 0);
+        buffer.setExpectedSenders(1, 1);
+
+        mgr.tryAdmit("q1", 0, 0, "left", chunk(1, 40));
+        assertTrue("first left chunk makes the side readable before either EOF", buffer.awaitReadable("left", 1_000));
+        assertEquals(0, buffer.getLeftDoneCount());
+        assertEquals(0, buffer.getRightDoneCount());
+    }
+
+    public void testLiveDrainAcceptsLateChunksAndReleasesBudget() throws Exception {
+        ShuffleBufferManager mgr = new ShuffleBufferManager();
+        mgr.setBudgets(60, 60);
+        ShuffleBufferManager.ShuffleBuffer buffer = mgr.getOrCreateBuffer("q1", 0, 0);
+        buffer.setExpectedSenders(1, 1);
+
+        assertEquals(AdmitResult.ACCEPTED, mgr.tryAdmit("q1", 0, 0, "left", chunk(1, 60)));
+        try (var it = buffer.streamLeft(1_000)) {
+            assertEquals((byte) 1, it.next()[0]);
+            assertEquals("consuming the resident chunk must free producer headroom", 0L, mgr.getTotalBytes());
+
+            assertEquals(
+                "a live drain must accept data that arrives after consumption starts",
+                AdmitResult.ACCEPTED,
+                mgr.tryAdmit("q1", 0, 0, "left", chunk(2, 60))
+            );
+            buffer.senderDone("left");
+            assertEquals((byte) 2, it.next()[0]);
+            assertFalse("EOF requires sender completion plus an empty live queue", it.hasNext());
+        }
+        assertEquals(0L, mgr.getQueryBytes("q1"));
+    }
+
+    public void testSpilledPrefixTransitionsToLiveBackpressuredQueue() throws Exception {
+        Path spillDir = createTempDir();
+        ShuffleBufferManager mgr = new ShuffleBufferManager();
+        mgr.setBudgets(100, 100);
+        mgr.setSpillConfig(true, spillDir, 1_000_000);
+        ShuffleBufferManager.ShuffleBuffer buffer = mgr.getOrCreateBuffer("q1", 0, 0);
+        buffer.setExpectedSenders(1, 1);
+
+        mgr.tryAdmit("q1", 0, 0, "left", chunk(0, 50));
+        mgr.tryAdmit("q1", 0, 0, "left", chunk(1, 50));
+        mgr.tryAdmit("q1", 0, 0, "left", chunk(2, 50)); // chunk 0 spills
+        try (var it = buffer.streamLeft(1_000)) {
+            assertEquals("spill prefix remains first", (byte) 0, it.next()[0]);
+            assertEquals(
+                "resident queue is still full until a live chunk is consumed",
+                AdmitResult.REJECT_RETRY,
+                mgr.tryAdmit("q1", 0, 0, "left", chunk(3, 50))
+            );
+            assertEquals((byte) 1, it.next()[0]);
+            assertEquals(AdmitResult.ACCEPTED, mgr.tryAdmit("q1", 0, 0, "left", chunk(3, 50)));
+            buffer.senderDone("left");
+            assertEquals((byte) 2, it.next()[0]);
+            assertEquals((byte) 3, it.next()[0]);
+            assertFalse(it.hasNext());
+        }
+        mgr.clearForQuery("q1");
+    }
+
+    public void testEarlyConsumerCloseDiscardsQueuedAndLateChunks() {
+        ShuffleBufferManager mgr = new ShuffleBufferManager();
+        mgr.setBudgets(100, 100);
+        ShuffleBufferManager.ShuffleBuffer buffer = mgr.getOrCreateBuffer("q1", 0, 0);
+        buffer.setExpectedSenders(1, 1);
+        mgr.tryAdmit("q1", 0, 0, "left", chunk(1, 60));
+
+        buffer.streamLeft(1_000).close();
+        assertEquals("queued resident bytes are released on early consumer close", 0L, mgr.getTotalBytes());
+        assertEquals(
+            "late producer data is acknowledged but discarded after receiver close",
+            AdmitResult.ACCEPTED,
+            mgr.tryAdmit("q1", 0, 0, "left", chunk(2, 60))
+        );
+        assertEquals(0L, mgr.getTotalBytes());
+    }
+
+    public void testLiveDrainDoesNotMakeSiblingSnapshotDrainAppendable() {
+        ShuffleBufferManager mgr = new ShuffleBufferManager();
+        mgr.setBudgets(1_000, 1_000);
+        ShuffleBufferManager.ShuffleBuffer buffer = mgr.getOrCreateBuffer("q1", 0, 0);
+        buffer.setExpectedSenders(1, 1);
+        mgr.tryAdmit("q1", 0, 0, "left", chunk(1, 10));
+        mgr.tryAdmit("q1", 0, 0, "right", chunk(2, 10));
+
+        try (var left = buffer.streamLeft(1_000); var right = buffer.drainRight()) {
+            assertEquals((byte) 2, right.next()[0]);
+            expectThrows(IllegalStateException.class, () -> mgr.tryAdmit("q1", 0, 0, "right", chunk(3, 10)));
+        }
+    }
+
     public void testAwaitReadyTimesOut() throws Exception {
         ShuffleBufferManager.ShuffleBuffer buffer = new ShuffleBufferManager.ShuffleBuffer();
         buffer.setExpectedSenders(1, 1);
