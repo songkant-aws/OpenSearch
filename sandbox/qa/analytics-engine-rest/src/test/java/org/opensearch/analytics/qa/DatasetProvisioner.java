@@ -51,9 +51,8 @@ public final class DatasetProvisioner {
         SINGLE_SEGMENT("1seg"),
         /**
          * Exactly {@link #MULTI_SEGMENT_COUNT} segments per shard: bulk in that many flushed parts.
-         * Parquet flush→segment is 1:1, so N parts give exactly N segments — deterministically pinning
-         * the scan's {@code input_partitions}. No force-merge: it caps "at most N" and could collapse
-         * tiny segments to 1; the default TieredMergePolicy won't auto-merge so few either.
+         * A final force-merge caps segments created by an internal bulk flush, deterministically
+         * pinning the scan's {@code input_partitions} without collapsing the layout to one segment.
          */
         MULTI_SEGMENT("nseg");
 
@@ -128,13 +127,13 @@ public final class DatasetProvisioner {
         String bulkBody = loadResource(bulkPath);
 
         if (layout == SegmentLayout.MULTI_SEGMENT) {
-            // Split the ndjson into MULTI_SEGMENT_COUNT parts at action/source boundaries; flush
-            // after each. Each flush is one parquet segment (1:1), so every shard ends up with
-            // exactly that many segments. No force-merge — it would only risk collapsing them
-            // (see SegmentLayout.MULTI_SEGMENT). Background merge leaves so few segments alone.
+            // Split the ndjson into MULTI_SEGMENT_COUNT parts at action/source boundaries and flush
+            // after each. A sufficiently large bulk can also flush internally, so cap the resulting
+            // topology before plan capture instead of assuming each request creates one segment.
             for (String part : splitNdjson(bulkBody, MULTI_SEGMENT_COUNT)) {
                 bulkAndFlush(client, indexName, part);
             }
+            forceMergeAndFlush(client, indexName, MULTI_SEGMENT_COUNT);
         } else {
             bulkAndFlush(client, indexName, bulkBody);
             if (layout == SegmentLayout.SINGLE_SEGMENT) {
