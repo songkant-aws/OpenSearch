@@ -16,13 +16,16 @@ import org.apache.calcite.plan.volcano.RelSubset;
 import org.apache.calcite.rel.RelDistribution;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.JoinInfo;
+import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.opensearch.analytics.AnalyticsSettings;
 import org.opensearch.analytics.exec.join.MppShufflePartitions;
+import org.opensearch.analytics.planner.OpenSearchRelMetadataQuery;
 import org.opensearch.analytics.planner.PlannerContext;
-import org.opensearch.analytics.planner.rel.OpenSearchAggregate;
 import org.opensearch.analytics.planner.rel.OpenSearchDistribution;
 import org.opensearch.analytics.planner.rel.OpenSearchDistributionTraitDef;
+import org.opensearch.analytics.planner.rel.OpenSearchFilter;
 import org.opensearch.analytics.planner.rel.OpenSearchJoin;
+import org.opensearch.analytics.planner.rel.OpenSearchProject;
 import org.opensearch.analytics.planner.rel.OpenSearchTableScan;
 
 /**
@@ -105,9 +108,6 @@ public class OpenSearchHashJoinSplitRule extends RelOptRule {
      *  producer would be a coordinator-reduce stage with no partitioned-sink hookup — the
      *  worker waits forever on senders that never ship. */
     private static boolean isShardScan(RelNode rel) {
-        OpenSearchDistribution dist = distributionOf(rel);
-        if (dist == null) return false;
-        if (dist.getLocality() != OpenSearchDistribution.Locality.SHARD) return false;
         return isPureShardScanShape(rel);
     }
 
@@ -120,13 +120,15 @@ public class OpenSearchHashJoinSplitRule extends RelOptRule {
             if (best == null || best == rel) return false;
             return isPureShardScanShape(best);
         }
-        if (rel instanceof OpenSearchTableScan) return true;
-        if (rel instanceof OpenSearchAggregate) return false;
-        if (rel instanceof OpenSearchJoin) return false;
-        for (RelNode input : rel.getInputs()) {
-            if (!isPureShardScanShape(input)) return false;
+        if (rel instanceof OpenSearchTableScan scan) {
+            OpenSearchDistribution distribution = distributionOf(scan);
+            return distribution != null && distribution.getLocality() == OpenSearchDistribution.Locality.SHARD;
         }
-        return !rel.getInputs().isEmpty();
+        if (rel instanceof OpenSearchFilter || rel instanceof OpenSearchProject) {
+            return rel.getInputs().size() == 1 && isPureShardScanShape(rel.getInput(0));
+        }
+        // Exchanges, aggregates, joins and every other reducer are deliberately excluded.
+        return false;
     }
 
     @Override
@@ -155,12 +157,26 @@ public class OpenSearchHashJoinSplitRule extends RelOptRule {
         RelNode shuffledLeft = convert(join.getLeft(), leftTraits);
         RelNode shuffledRight = convert(join.getRight(), rightTraits);
 
+        // Build-side statistics are taken after filter/project pushdown. Row width therefore tracks
+        // the columns that really cross the shuffle, not the original index mapping, and bytes are
+        // divided across worker partitions before applying the hash-table overhead.
+        RelMetadataQuery mq = call.getMetadataQuery();
+        Double buildRowsValue = mq.getRowCount(join.getRight());
+        double buildRows = buildRowsValue == null ? Double.NaN : buildRowsValue;
+        Double averageRowSize = mq.getAverageRowSize(join.getRight());
+        double rowWidth = averageRowSize == null || !Double.isFinite(averageRowSize) || averageRowSize <= 0d
+            ? OpenSearchRelMetadataQuery.estimateRowWidthBytes(join.getRight().getRowType())
+            : averageRowSize;
+        double buildBytesPerWorker = Double.isFinite(buildRows) ? buildRows * rowWidth * 1.5d / partitionCount : Double.NaN;
+        long maxBuildRows = AnalyticsSettings.MPP_WORKER_SORT_MERGE_JOIN_MIN_ROWS.get(context.getSettings());
+        long maxBytesPerWorker = AnalyticsSettings.MPP_WORKER_HASH_JOIN_MAX_BYTES.get(context.getSettings()).getBytes();
+
         // The hash-join itself runs at WORKER+HASH(leftKeys, N). Convention: use the left
         // keys as the join's own hash key marker; OpenSearchJoin's derive contract uses the
         // matching left/right equi keys for future parent requirements.
         OpenSearchDistribution joinHash = distTraitDef.hash(info.leftKeys, partitionCount);
         RelTraitSet joinTraits = join.getTraitSet().replace(joinHash);
-        RelNode workerJoin = join.copy(
+        OpenSearchJoin workerJoin = (OpenSearchJoin) join.copy(
             joinTraits,
             join.getCondition(),
             shuffledLeft,
@@ -169,10 +185,31 @@ public class OpenSearchHashJoinSplitRule extends RelOptRule {
             join.isSemiJoinDone()
         );
 
-        // Coord still needs the result; convert WORKER → COORDINATOR registers a final gather
-        // ER above. The transformTo target carries WORKER traits; Volcano's enforcement will
-        // wrap with an ER when a SINGLETON consumer demands it.
-        RelTraitSet coordTraits = join.getTraitSet().replace(distTraitDef.coordSingleton());
+        // Register two physically distinct alternatives in the memo. Their explain terms make
+        // their digests distinct; OpenSearchJoin.computeSelfCost makes HJ infinite when the build
+        // violates either safety budget, otherwise HJ wins over the sorting work of SMJ.
+        emitAlgorithmAlternative(
+            call,
+            join,
+            workerJoin.withJoinAlgorithm(OpenSearchJoin.JoinAlgorithm.HASH, buildRows, buildBytesPerWorker, maxBuildRows, maxBytesPerWorker)
+        );
+        emitAlgorithmAlternative(
+            call,
+            join,
+            workerJoin.withJoinAlgorithm(
+                OpenSearchJoin.JoinAlgorithm.SORT_MERGE,
+                buildRows,
+                buildBytesPerWorker,
+                maxBuildRows,
+                maxBytesPerWorker
+            )
+        );
+    }
+
+    private void emitAlgorithmAlternative(RelOptRuleCall call, OpenSearchJoin originalJoin, OpenSearchJoin workerJoin) {
+        // Coord still needs the result; register the gather so a SINGLETON consumer can reach
+        // this algorithm-specific worker implementation.
+        RelTraitSet coordTraits = originalJoin.getTraitSet().replace(distTraitDef.coordSingleton());
         convert(workerJoin, coordTraits);
         call.transformTo(workerJoin);
     }

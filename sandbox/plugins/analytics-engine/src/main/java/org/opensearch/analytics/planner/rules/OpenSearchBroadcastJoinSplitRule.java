@@ -12,6 +12,7 @@ import org.apache.calcite.plan.RelOptRule;
 import org.apache.calcite.plan.RelOptRuleCall;
 import org.apache.calcite.plan.RelTrait;
 import org.apache.calcite.plan.RelTraitSet;
+import org.apache.calcite.plan.volcano.RelSubset;
 import org.apache.calcite.rel.RelDistribution;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.JoinInfo;
@@ -20,10 +21,14 @@ import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.analytics.AnalyticsSettings;
+import org.opensearch.analytics.planner.OpenSearchRelMetadataQuery;
 import org.opensearch.analytics.planner.PlannerContext;
 import org.opensearch.analytics.planner.rel.OpenSearchDistribution;
 import org.opensearch.analytics.planner.rel.OpenSearchDistributionTraitDef;
+import org.opensearch.analytics.planner.rel.OpenSearchFilter;
 import org.opensearch.analytics.planner.rel.OpenSearchJoin;
+import org.opensearch.analytics.planner.rel.OpenSearchProject;
+import org.opensearch.analytics.planner.rel.OpenSearchTableScan;
 
 /**
  * Broadcast-join split rule (M2). Sibling of {@link OpenSearchJoinSplitRule} (coord-centric)
@@ -161,11 +166,9 @@ public class OpenSearchBroadcastJoinSplitRule extends RelOptRule {
      * ({@code DefaultPlanExecutor}). Spark relies on AQE measuring materialized shuffle output to
      * the same end; we re-plan on the capture-sink overflow instead.
      *
-     * <p>Row width is derived from the build-side {@code RelDataType} directly (sum of per-column
-     * type widths), NOT from {@code RelMetadataQuery.getAverageRowSize}: the {@code OpenSearch*}
-     * RelNodes don't register a {@code BuiltInMetadata.Size} handler, so {@code getAverageRowSize}
-     * returns {@code null} for them. Computing from the row type keeps the gate self-contained and
-     * matches Calcite's own per-type width heuristics (see {@code RelMdSize.averageTypeValueSize}).
+     * <p>Row width comes from {@link OpenSearchRelMetadataQuery#getAverageRowSize}, which derives a
+     * projection-aware estimate for custom OpenSearch rels. A direct row-type estimate remains the
+     * fallback for tests or callers using Calcite's default metadata query.
      *
      * <p>Returns {@code true} (admit broadcast) when the row count is unknown or the row width can't
      * be estimated: missing stats must not suppress broadcast. A cap of {@code 0} (or negative)
@@ -179,7 +182,10 @@ public class OpenSearchBroadcastJoinSplitRule extends RelOptRule {
         if (rows == null || rows.isInfinite() || rows.isNaN()) {
             return true;
         }
-        double avgRowWidth = estimateRowWidthBytes(buildSide.getRowType());
+        Double metadataWidth = mq.getAverageRowSize(buildSide);
+        double avgRowWidth = metadataWidth == null || !Double.isFinite(metadataWidth) || metadataWidth <= 0d
+            ? OpenSearchRelMetadataQuery.estimateRowWidthBytes(buildSide.getRowType())
+            : metadataWidth;
         if (avgRowWidth <= 0) {
             return true;
         }
@@ -199,74 +205,6 @@ public class OpenSearchBroadcastJoinSplitRule extends RelOptRule {
     }
 
     /**
-     * Average bytes per row for a {@code RelDataType}, summed over per-column type widths. Mirrors
-     * Calcite's {@code RelMdSize.averageTypeValueSize} heuristics (fixed-width types by precision;
-     * variable-width CHAR/VARCHAR/BINARY capped). Unknown column types contribute a conservative
-     * default so a partially-typed row still estimates non-zero rather than collapsing to 0.
-     */
-    private static double estimateRowWidthBytes(org.apache.calcite.rel.type.RelDataType rowType) {
-        double total = 0d;
-        for (org.apache.calcite.rel.type.RelDataTypeField field : rowType.getFieldList()) {
-            total += averageTypeWidthBytes(field.getType());
-        }
-        return total;
-    }
-
-    /**
-     * Per-column average width in bytes — a LOCAL heuristic in the spirit of Calcite's
-     * {@code RelMdSize.averageTypeValueSize} (fixed-width types by size, variable-width CHAR/VARCHAR/
-     * BINARY capped), but not an exact mirror: less-common SQL types (unsigned ints, time/timestamp
-     * -with-zone, intervals) fall through to {@code defaultWidth} rather than their exact Calcite
-     * sizes. That's acceptable here — the result feeds a coarse broadcast size gate backed by a
-     * runtime cap + retry, not anything that needs byte-exact accounting.
-     */
-    private static double averageTypeWidthBytes(org.apache.calcite.rel.type.RelDataType type) {
-        // BYTES_PER_CHARACTER in Calcite's RelMdSize is 2 (UTF-16 estimate).
-        final int bytesPerChar = 2;
-        // Width estimate for variable-width string/binary columns: Calcite caps these at 100 bytes
-        // since most values are small even in wide columns. We also USE this as the width when the
-        // precision is unspecified — OpenSearch keyword/text fields commonly arrive as bare VARCHAR
-        // with RelDataType.PRECISION_NOT_SPECIFIED (-1), and feeding -1 into the formulas below would
-        // yield a negative width that silently zeroes the row estimate and no-ops the size gate.
-        final double variableWidthCap = 100d;
-        final double defaultWidth = 8d; // conservative fallback for types we don't special-case
-        if (type.getSqlTypeName() == null) {
-            return defaultWidth;
-        }
-        int precision = type.getPrecision(); // may be PRECISION_NOT_SPECIFIED (-1)
-        switch (type.getSqlTypeName()) {
-            case BOOLEAN:
-            case TINYINT:
-                return 1d;
-            case SMALLINT:
-                return 2d;
-            case INTEGER:
-            case REAL:
-            case DECIMAL:
-            case DATE:
-            case TIME:
-                return 4d;
-            case BIGINT:
-            case DOUBLE:
-            case FLOAT:
-            case TIMESTAMP:
-                return 8d;
-            case BINARY:
-                return precision > 0 ? precision : variableWidthCap;
-            case VARBINARY:
-                return precision > 0 ? Math.min(precision, variableWidthCap) : variableWidthCap;
-            case CHAR:
-                return precision > 0 ? (double) precision * bytesPerChar : variableWidthCap;
-            case VARCHAR:
-                // Even in large (e.g. VARCHAR(2000)) columns most strings are small; unspecified
-                // precision (the common OpenSearch keyword/text case) falls back to the cap.
-                return precision > 0 ? Math.min((double) precision * bytesPerChar, variableWidthCap) : variableWidthCap;
-            default:
-                return defaultWidth;
-        }
-    }
-
-    /**
      * Emits one broadcast alternative: the chosen build side is wrapped in a broadcast
      * exchange (via trait conversion); the other side (probe) keeps its SHARD trait. The
      * join's own trait is the probe side's SHARD+RANDOM, which propagates the probe's
@@ -277,10 +215,11 @@ public class OpenSearchBroadcastJoinSplitRule extends RelOptRule {
     private void emitBroadcastAlternative(RelOptRuleCall call, OpenSearchJoin join, boolean leftIsBuild, int probeNodes) {
         RelNode buildSide = leftIsBuild ? join.getLeft() : join.getRight();
         RelNode probeSide = leftIsBuild ? join.getRight() : join.getLeft();
-        OpenSearchDistribution probeDist = distributionOf(probeSide);
+        OpenSearchDistribution probeDist = shardDistributionOf(probeSide);
         if (probeDist == null) {
             return;
         }
+        RelNode localizedProbe = convert(probeSide, probeSide.getTraitSet().replace(probeDist));
 
         // Demand BROADCAST+REPLICATED on the build side. Volcano materializes an
         // OpenSearchBroadcastExchange via OpenSearchDistributionTraitDef.convert.
@@ -294,9 +233,23 @@ public class OpenSearchBroadcastJoinSplitRule extends RelOptRule {
         RelTraitSet joinTraits = join.getTraitSet().replace(distTraitDef.from(probeDist));
         RelNode workerJoin;
         if (leftIsBuild) {
-            workerJoin = join.copy(joinTraits, join.getCondition(), broadcastBuild, probeSide, join.getJoinType(), join.isSemiJoinDone());
+            workerJoin = join.copy(
+                joinTraits,
+                join.getCondition(),
+                broadcastBuild,
+                localizedProbe,
+                join.getJoinType(),
+                join.isSemiJoinDone()
+            );
         } else {
-            workerJoin = join.copy(joinTraits, join.getCondition(), probeSide, broadcastBuild, join.getJoinType(), join.isSemiJoinDone());
+            workerJoin = join.copy(
+                joinTraits,
+                join.getCondition(),
+                localizedProbe,
+                broadcastBuild,
+                join.getJoinType(),
+                join.isSemiJoinDone()
+            );
         }
 
         // Coord still gathers the joined output. Register the gather alternative in the memo
@@ -328,9 +281,33 @@ public class OpenSearchBroadcastJoinSplitRule extends RelOptRule {
     /** True when {@code rel}'s OpenSearchDistribution is SHARD-localized — i.e. the rel is an
      *  unwrapped scan (or scan-shaped subtree) without an exchange already on top. */
     private static boolean isShardScan(RelNode rel) {
-        OpenSearchDistribution dist = distributionOf(rel);
-        if (dist == null) return false;
-        return dist.getLocality() == OpenSearchDistribution.Locality.SHARD;
+        if (rel instanceof RelSubset subset) {
+            RelNode best = subset.getBestOrOriginal();
+            return best != null && best != rel && isShardScan(best);
+        }
+        if (rel instanceof OpenSearchTableScan scan) {
+            OpenSearchDistribution dist = distributionOf(scan);
+            return dist != null && dist.getLocality() == OpenSearchDistribution.Locality.SHARD;
+        }
+        if (rel instanceof OpenSearchFilter || rel instanceof OpenSearchProject) {
+            return rel.getInputs().size() == 1 && isShardScan(rel.getInput(0));
+        }
+        return false;
+    }
+
+    private static OpenSearchDistribution shardDistributionOf(RelNode rel) {
+        if (rel instanceof RelSubset subset) {
+            RelNode best = subset.getBestOrOriginal();
+            return best == null || best == rel ? null : shardDistributionOf(best);
+        }
+        OpenSearchDistribution own = distributionOf(rel);
+        if (own != null && own.getLocality() == OpenSearchDistribution.Locality.SHARD) {
+            return own;
+        }
+        if ((rel instanceof OpenSearchFilter || rel instanceof OpenSearchProject) && rel.getInputs().size() == 1) {
+            return shardDistributionOf(rel.getInput(0));
+        }
+        return null;
     }
 
     private static OpenSearchDistribution distributionOf(RelNode rel) {

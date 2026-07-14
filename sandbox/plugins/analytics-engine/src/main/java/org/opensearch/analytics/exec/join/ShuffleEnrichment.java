@@ -16,6 +16,7 @@ import org.opensearch.analytics.planner.CapabilityRegistry;
 import org.opensearch.analytics.planner.RelNodeUtils;
 import org.opensearch.analytics.planner.dag.Stage;
 import org.opensearch.analytics.planner.dag.StagePlan;
+import org.opensearch.analytics.planner.rel.OpenSearchJoin;
 import org.opensearch.analytics.planner.rel.OpenSearchTableScan;
 import org.opensearch.analytics.spi.DataTransferCapability;
 import org.opensearch.analytics.spi.InstructionNode;
@@ -126,12 +127,16 @@ public final class ShuffleEnrichment {
                 "right",
                 capabilityRegistry
             );
-            // Cost decision (Spark-style, made where the stats live — on the coordinator): if the build side
-            // (right input) is estimated to exceed the sort-merge-join floor, tell the worker to use a
-            // spillable sort-merge join instead of the non-spillable hash-join build. Estimated from the
-            // right producer's largest scan subtree (the build feeds from the right producer's shuffle).
+            // CBO-selected implementation wins. AUTO is retained only for joins introduced/distributed
+            // after CBO by DistributionEnforcementPass; those use the old scan-row heuristic as a safe
+            // compatibility fallback until every such shape is represented as a Volcano alternative.
             long buildRows = subtreeMaxScanRows(level.rightProducer().getFragment());
-            boolean preferHashJoin = buildRows < sortMergeJoinMinRows;
+            OpenSearchJoin.JoinAlgorithm joinAlgorithm = workerJoinAlgorithm(worker.getFragment());
+            boolean preferHashJoin = switch (joinAlgorithm) {
+                case HASH -> true;
+                case SORT_MERGE -> false;
+                case AUTO -> buildRows < sortMergeJoinMinRows;
+            };
 
             // The worker consumes its two producers' partitions. enrichWorkerAlternatives prepends a setup
             // placeholder and appends per-(partition,side) scans; a producer instruction (added above when
@@ -150,13 +155,14 @@ public final class ShuffleEnrichment {
 
             LOGGER.debug(
                 "[ShuffleEnrichment] level worker={} left={} right={} partitions={} leftSenders={} rightSenders={} "
-                    + "buildRows={} preferHashJoin={} targets={}",
+                    + "joinAlgorithm={} buildRows={} preferHashJoin={} targets={}",
                 workerStageId,
                 level.leftProducer().getStageId(),
                 level.rightProducer().getStageId(),
                 partitionCount,
                 leftExpected,
                 rightExpected,
+                joinAlgorithm,
                 buildRows,
                 preferHashJoin,
                 targets
@@ -295,5 +301,22 @@ public final class ShuffleEnrichment {
             max = Math.max(max, subtreeMaxScanRows(input));
         }
         return max;
+    }
+
+    static OpenSearchJoin.JoinAlgorithm workerJoinAlgorithm(RelNode node) {
+        if (node == null) {
+            return OpenSearchJoin.JoinAlgorithm.AUTO;
+        }
+        RelNode n = RelNodeUtils.unwrapHep(node);
+        if (n instanceof OpenSearchJoin join) {
+            return join.getJoinAlgorithm();
+        }
+        for (RelNode input : n.getInputs()) {
+            OpenSearchJoin.JoinAlgorithm algorithm = workerJoinAlgorithm(input);
+            if (algorithm != OpenSearchJoin.JoinAlgorithm.AUTO) {
+                return algorithm;
+            }
+        }
+        return OpenSearchJoin.JoinAlgorithm.AUTO;
     }
 }

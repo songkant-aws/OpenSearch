@@ -61,9 +61,12 @@ public class OpenSearchJoinCostTests extends BasePlannerRulesTests {
         RelOptCost coordinatorCost = costOf(
             makeJoin(scanWith(traitDef.coordSingleton()), scanWith(traitDef.coordSingleton()), traitDef.coordSingleton())
         );
-        RelOptCost hashCost = costOf(
-            makeJoin(scanWith(traitDef.hash(List.of(0), 4)), scanWith(traitDef.hash(List.of(0), 4)), traitDef.hash(List.of(0), 4))
-        );
+        OpenSearchJoin hashJoin = makeJoin(
+            scanWith(traitDef.hash(List.of(0), 4)),
+            scanWith(traitDef.hash(List.of(0), 4)),
+            traitDef.hash(List.of(0), 4)
+        ).withJoinAlgorithm(OpenSearchJoin.JoinAlgorithm.HASH, 100d, 1_000d, 20_000_000L, 512L * 1024 * 1024);
+        RelOptCost hashCost = costOf(hashJoin);
 
         assertFalse(hashCost.isInfinite());
         assertTrue("hash work should be divided over its partitions", hashCost.isLt(coordinatorCost));
@@ -79,6 +82,40 @@ public class OpenSearchJoinCostTests extends BasePlannerRulesTests {
 
         assertFalse(broadcastCost.isInfinite());
         assertTrue("broadcast work should be divided over probe nodes", broadcastCost.isLt(coordinatorCost));
+    }
+
+    public void testMemorySafeHashJoinCostsLessThanSortMerge() {
+        OpenSearchDistribution hash = traitDef.hash(List.of(0), 4);
+        OpenSearchJoin base = makeJoin(scanWith(hash), scanWith(hash), hash);
+        OpenSearchJoin hashJoin = base.withJoinAlgorithm(
+            OpenSearchJoin.JoinAlgorithm.HASH,
+            1_000_000d,
+            32d * 1024 * 1024,
+            20_000_000L,
+            512L * 1024 * 1024
+        );
+        OpenSearchJoin sortMerge = base.withJoinAlgorithm(
+            OpenSearchJoin.JoinAlgorithm.SORT_MERGE,
+            1_000_000d,
+            32d * 1024 * 1024,
+            20_000_000L,
+            512L * 1024 * 1024
+        );
+
+        assertTrue("HJ should win when its build fits both budgets", costOf(hashJoin).isLt(costOf(sortMerge)));
+    }
+
+    public void testHashJoinOverByteBudgetIsIneligible() {
+        OpenSearchDistribution hash = traitDef.hash(List.of(0), 4);
+        OpenSearchJoin hashJoin = makeJoin(scanWith(hash), scanWith(hash), hash).withJoinAlgorithm(
+            OpenSearchJoin.JoinAlgorithm.HASH,
+            1_000_000d,
+            600d * 1024 * 1024,
+            20_000_000L,
+            512L * 1024 * 1024
+        );
+
+        assertTrue("non-spillable HJ must be rejected when its per-worker hash table exceeds budget", costOf(hashJoin).isInfinite());
     }
 
     private OpenSearchTableScan scanWith(OpenSearchDistribution distribution) {

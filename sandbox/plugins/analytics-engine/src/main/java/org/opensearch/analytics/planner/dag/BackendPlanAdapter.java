@@ -136,7 +136,12 @@ public class BackendPlanAdapter {
                 right,
                 adaptedCondition,
                 join.getJoinType(),
-                join.getViableBackends()
+                join.getViableBackends(),
+                join.getJoinAlgorithm(),
+                join.getEstimatedBuildRows(),
+                join.getEstimatedBuildBytesPerWorker(),
+                join.getHashJoinMaxBuildRows(),
+                join.getHashJoinMaxBytesPerWorker()
             );
         }
         return join;

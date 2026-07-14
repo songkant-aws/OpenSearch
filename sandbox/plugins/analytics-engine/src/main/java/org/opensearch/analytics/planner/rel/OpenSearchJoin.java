@@ -44,7 +44,20 @@ import java.util.Set;
  */
 public class OpenSearchJoin extends Join implements OpenSearchRelNode, DistributionAware {
 
+    /** Physical implementation selected for a worker hash-shuffle join. */
+    public enum JoinAlgorithm {
+        /** Compatibility fallback for joins distributed only by the post-CBO enforcement pass. */
+        AUTO,
+        HASH,
+        SORT_MERGE
+    }
+
     private final List<String> viableBackends;
+    private final JoinAlgorithm joinAlgorithm;
+    private final double estimatedBuildRows;
+    private final double estimatedBuildBytesPerWorker;
+    private final long hashJoinMaxBuildRows;
+    private final long hashJoinMaxBytesPerWorker;
 
     public OpenSearchJoin(
         RelOptCluster cluster,
@@ -55,8 +68,73 @@ public class OpenSearchJoin extends Join implements OpenSearchRelNode, Distribut
         JoinRelType joinType,
         List<String> viableBackends
     ) {
+        this(cluster, traitSet, left, right, condition, joinType, viableBackends, JoinAlgorithm.AUTO, Double.NaN, Double.NaN, -1L, -1L);
+    }
+
+    public OpenSearchJoin(
+        RelOptCluster cluster,
+        RelTraitSet traitSet,
+        RelNode left,
+        RelNode right,
+        RexNode condition,
+        JoinRelType joinType,
+        List<String> viableBackends,
+        JoinAlgorithm joinAlgorithm,
+        double estimatedBuildRows,
+        double estimatedBuildBytesPerWorker,
+        long hashJoinMaxBuildRows,
+        long hashJoinMaxBytesPerWorker
+    ) {
         super(cluster, traitSet, List.of(), left, right, condition, Set.of(), joinType);
         this.viableBackends = viableBackends;
+        this.joinAlgorithm = joinAlgorithm;
+        this.estimatedBuildRows = estimatedBuildRows;
+        this.estimatedBuildBytesPerWorker = estimatedBuildBytesPerWorker;
+        this.hashJoinMaxBuildRows = hashJoinMaxBuildRows;
+        this.hashJoinMaxBytesPerWorker = hashJoinMaxBytesPerWorker;
+    }
+
+    public OpenSearchJoin withJoinAlgorithm(
+        JoinAlgorithm algorithm,
+        double buildRows,
+        double buildBytesPerWorker,
+        long maxBuildRows,
+        long maxBytesPerWorker
+    ) {
+        return new OpenSearchJoin(
+            getCluster(),
+            getTraitSet(),
+            getLeft(),
+            getRight(),
+            getCondition(),
+            getJoinType(),
+            viableBackends,
+            algorithm,
+            buildRows,
+            buildBytesPerWorker,
+            maxBuildRows,
+            maxBytesPerWorker
+        );
+    }
+
+    public JoinAlgorithm getJoinAlgorithm() {
+        return joinAlgorithm;
+    }
+
+    public double getEstimatedBuildRows() {
+        return estimatedBuildRows;
+    }
+
+    public double getEstimatedBuildBytesPerWorker() {
+        return estimatedBuildBytesPerWorker;
+    }
+
+    public long getHashJoinMaxBuildRows() {
+        return hashJoinMaxBuildRows;
+    }
+
+    public long getHashJoinMaxBytesPerWorker() {
+        return hashJoinMaxBytesPerWorker;
     }
 
     @Override
@@ -92,7 +170,20 @@ public class OpenSearchJoin extends Join implements OpenSearchRelNode, Distribut
 
     @Override
     public Join copy(RelTraitSet traitSet, RexNode conditionExpr, RelNode left, RelNode right, JoinRelType joinType, boolean semiJoinDone) {
-        return new OpenSearchJoin(getCluster(), traitSet, left, right, conditionExpr, joinType, viableBackends);
+        return new OpenSearchJoin(
+            getCluster(),
+            traitSet,
+            left,
+            right,
+            conditionExpr,
+            joinType,
+            viableBackends,
+            joinAlgorithm,
+            estimatedBuildRows,
+            estimatedBuildBytesPerWorker,
+            hashJoinMaxBuildRows,
+            hashJoinMaxBytesPerWorker
+        );
     }
 
     @Override
@@ -252,6 +343,31 @@ public class OpenSearchJoin extends Join implements OpenSearchRelNode, Distribut
             }
         }
         double executionCost = inputRows / parallelism;
+        if (isHashWorker) {
+            if (joinAlgorithm == JoinAlgorithm.AUTO) {
+                // A distribution trait says where the join runs, not how it runs. Top-down
+                // deriveTraits can produce WORKER+HASH on the unresolved marker join; do not let
+                // that cheaper marker beat the explicit HJ/SMJ implementations emitted by the
+                // split rule. AUTO remains valid for joins distributed after CBO, where cost is no
+                // longer consulted and ShuffleEnrichment supplies the compatibility fallback.
+                return planner.getCostFactory().makeInfiniteCost();
+            } else if (joinAlgorithm == JoinAlgorithm.HASH) {
+                boolean rowLimitExceeded = hashJoinMaxBuildRows >= 0 && estimatedBuildRows >= hashJoinMaxBuildRows;
+                boolean byteLimitExceeded = hashJoinMaxBytesPerWorker > 0 && estimatedBuildBytesPerWorker > hashJoinMaxBytesPerWorker;
+                if (rowLimitExceeded || byteLimitExceeded) {
+                    return planner.getCostFactory().makeInfiniteCost();
+                }
+                // HJ is the baseline when memory-safe. Keep a small hash-table construction
+                // premium in the same normalized unit as the existing planner cost model.
+                executionCost *= 1.02d;
+            } else if (joinAlgorithm == JoinAlgorithm.SORT_MERGE) {
+                // EnforceSorting materializes the actual sorts. The current OpenSearch cost model
+                // is deliberately row-normalized (Volcano compares only its first dimension), so
+                // represent sorting/spill as a bounded premium: high enough that safe HJ wins, but
+                // not so high that a memory-safe distributed SMJ loses to gathering both sides.
+                executionCost *= 1.15d;
+            }
+        }
         return planner.getCostFactory().makeCost(executionCost, executionCost, 0);
     }
 
@@ -327,7 +443,10 @@ public class OpenSearchJoin extends Join implements OpenSearchRelNode, Distribut
 
     @Override
     public RelWriter explainTerms(RelWriter pw) {
-        return super.explainTerms(pw).item("viableBackends", viableBackends);
+        return super.explainTerms(pw).item("viableBackends", viableBackends)
+            .itemIf("joinAlgorithm", joinAlgorithm, joinAlgorithm != JoinAlgorithm.AUTO)
+            .itemIf("estimatedBuildRows", estimatedBuildRows, Double.isFinite(estimatedBuildRows))
+            .itemIf("estimatedBuildBytesPerWorker", estimatedBuildBytesPerWorker, Double.isFinite(estimatedBuildBytesPerWorker));
     }
 
     @Override
@@ -339,7 +458,12 @@ public class OpenSearchJoin extends Join implements OpenSearchRelNode, Distribut
             children.get(1),
             getCondition(),
             getJoinType(),
-            List.of(backend)
+            List.of(backend),
+            joinAlgorithm,
+            estimatedBuildRows,
+            estimatedBuildBytesPerWorker,
+            hashJoinMaxBuildRows,
+            hashJoinMaxBytesPerWorker
         );
     }
 

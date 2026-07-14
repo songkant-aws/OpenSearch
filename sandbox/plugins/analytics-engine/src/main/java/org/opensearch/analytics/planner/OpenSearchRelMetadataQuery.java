@@ -13,8 +13,15 @@ import org.apache.calcite.rel.core.Join;
 import org.apache.calcite.rel.core.JoinInfo;
 import org.apache.calcite.rel.metadata.RelMdUtil;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
+import org.apache.calcite.rel.type.RelDataType;
+import org.apache.calcite.rel.type.RelDataTypeField;
+import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.rex.RexShuttle;
+import org.opensearch.analytics.planner.rel.AnnotatedPredicate;
+import org.opensearch.analytics.planner.rel.OpenSearchFilter;
 import org.opensearch.analytics.planner.rel.OpenSearchJoin;
+import org.opensearch.analytics.planner.rel.OpenSearchRelNode;
 
 /**
  * Metadata query that corrects Calcite's no-statistics equi-join cardinality estimate for
@@ -54,11 +61,10 @@ import org.opensearch.analytics.planner.rel.OpenSearchJoin;
  * <p><b>Scope &amp; safety.</b> Only {@link OpenSearchJoin} with at least one equi key is
  * intercepted; SEMI/ANTI joins (which {@code getJoinRowCount} already estimates from the
  * left side alone), pure-theta joins (no equi keys), and every other RelNode fall through to
- * {@code super.getRowCount}. ALL other metadata defs (selectivity, column uniqueness, distinct row
- * count, collation, …) are inherited unchanged from {@link RelMetadataQuery} — this subclass adds
- * one override and nothing else, so the default Janino handler chain stays intact. (An earlier
- * attempt that swapped the whole {@code RelMetadataProvider} broke every other metadata call with
- * {@code NoHandler}; subclassing avoids that entirely.)
+ * {@code super.getRowCount}. Filter annotations are unwrapped before selectivity estimation so
+ * planner routing metadata does not hide the real predicate, and OpenSearch physical rels receive a
+ * row-type-based average-width estimate for memory costing. Column NDV, histograms and correlations
+ * are still inherited/unknown; this is deliberately not presented as a full statistics subsystem.
  *
  * @opensearch.internal
  */
@@ -71,6 +77,16 @@ public final class OpenSearchRelMetadataQuery extends RelMetadataQuery {
 
     @Override
     public Double getRowCount(RelNode rel) {
+        if (rel instanceof OpenSearchFilter filter) {
+            Double inputRows = getRowCount(filter.getInput());
+            if (inputRows != null) {
+                RexNode condition = unwrapPredicateAnnotations(filter.getCondition());
+                Double selectivity = getSelectivity(filter.getInput(), condition);
+                if (selectivity != null) {
+                    return inputRows * selectivity;
+                }
+            }
+        }
         if (rel instanceof OpenSearchJoin join) {
             Double corrected = fkJoinRowCount(join);
             if (corrected != null) {
@@ -78,6 +94,63 @@ public final class OpenSearchRelMetadataQuery extends RelMetadataQuery {
             }
         }
         return super.getRowCount(rel);
+    }
+
+    /** Planner annotations are routing metadata and must not hide the predicate from selectivity. */
+    private static RexNode unwrapPredicateAnnotations(RexNode condition) {
+        return condition.accept(new RexShuttle() {
+            @Override
+            public RexNode visitCall(RexCall call) {
+                if (call instanceof AnnotatedPredicate annotated) {
+                    return annotated.getOriginal().accept(this);
+                }
+                return super.visitCall(call);
+            }
+        });
+    }
+
+    /**
+     * Projection-aware row-width estimate for OpenSearch physical rels. Calcite's default size
+     * metadata has no handler for these custom nodes, which otherwise leaves broadcast/hash-join
+     * memory decisions with a null size. Deriving width from the current row type means a pushed
+     * projection immediately reduces the estimated build bytes.
+     */
+    @Override
+    public Double getAverageRowSize(RelNode rel) {
+        if (rel instanceof OpenSearchRelNode) {
+            return estimateRowWidthBytes(rel.getRowType());
+        }
+        return super.getAverageRowSize(rel);
+    }
+
+    /** Coarse in-memory width estimate, following Calcite's {@code RelMdSize} conventions. */
+    public static double estimateRowWidthBytes(RelDataType rowType) {
+        double total = 0d;
+        for (RelDataTypeField field : rowType.getFieldList()) {
+            total += averageTypeWidthBytes(field.getType());
+        }
+        return total;
+    }
+
+    private static double averageTypeWidthBytes(RelDataType type) {
+        final int bytesPerChar = 2;
+        final double variableWidthCap = 100d;
+        final double defaultWidth = 8d;
+        if (type.getSqlTypeName() == null) {
+            return defaultWidth;
+        }
+        int precision = type.getPrecision();
+        return switch (type.getSqlTypeName()) {
+            case BOOLEAN, TINYINT -> 1d;
+            case SMALLINT -> 2d;
+            case INTEGER, REAL, DECIMAL, DATE, TIME -> 4d;
+            case BIGINT, DOUBLE, FLOAT, TIMESTAMP -> 8d;
+            case BINARY -> precision > 0 ? precision : variableWidthCap;
+            case VARBINARY -> precision > 0 ? Math.min(precision, variableWidthCap) : variableWidthCap;
+            case CHAR -> precision > 0 ? (double) precision * bytesPerChar : variableWidthCap;
+            case VARCHAR -> precision > 0 ? Math.min((double) precision * bytesPerChar, variableWidthCap) : variableWidthCap;
+            default -> defaultWidth;
+        };
     }
 
     /**

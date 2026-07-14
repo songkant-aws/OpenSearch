@@ -10,7 +10,9 @@ package org.opensearch.analytics.planner;
 
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.JoinRelType;
+import org.apache.calcite.rel.logical.LogicalFilter;
 import org.apache.calcite.rel.logical.LogicalJoin;
+import org.apache.calcite.rel.logical.LogicalProject;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
@@ -93,6 +95,79 @@ public class JoinStrategyCBOSelectionTests extends BasePlannerRulesTests {
 
         assertContainsShuffleExchange("large × large with mpp.enabled must pick HASH_SHUFFLE", result);
         assertDoesNotContainBroadcastExchange("large × large must not broadcast (would replicate 10M rows × 3 nodes)", result);
+        assertEquals(
+            "10M rows × two projected INTs / 3 partitions fits the default worker byte budget",
+            OpenSearchJoin.JoinAlgorithm.HASH,
+            findWorkerJoinAlgorithm(result)
+        );
+    }
+
+    public void testRowBudgetForcesSortMergeJoin() {
+        Settings settings = Settings.builder()
+            .put("analytics.mpp.worker.sort_merge_join_min_rows", 1_000_000L)
+            .put("analytics.mpp.worker.hash_join_max_bytes", "1gb")
+            .build();
+        PlannerContext context = buildMppContext(
+            Map.of("big_left", 3, "big_right", 3),
+            Map.of("big_left", LARGE, "big_right", LARGE),
+            true,
+            settings
+        );
+        RelNode result = runPlanner(makeJoin(context, "big_left", "big_right", JoinRelType.INNER, true), context);
+
+        assertContainsShuffleExchange("large × large must remain hash-shuffled", result);
+        assertEquals(OpenSearchJoin.JoinAlgorithm.SORT_MERGE, findWorkerJoinAlgorithm(result));
+    }
+
+    public void testProjectedRowWidthCanKeepHashJoinWithinByteBudget() {
+        Settings settings = Settings.builder()
+            .put("analytics.mpp.worker.sort_merge_join_min_rows", Long.MAX_VALUE)
+            .put("analytics.mpp.worker.hash_join_max_bytes", "30mb")
+            .put("analytics.mpp.broadcast.max_bytes", "1b")
+            .build();
+        PlannerContext context = buildMppContext(
+            Map.of("big_left", 3, "big_right", 3),
+            Map.of("big_left", LARGE, "big_right", LARGE),
+            true,
+            settings
+        );
+        RelNode wideResult = runPlanner(makeJoin(context, "big_left", "big_right", JoinRelType.INNER, true), context);
+        RelNode projectedResult = runPlanner(makeProjectedBuildJoin(context, "big_left", "big_right"), context);
+
+        assertEquals(
+            "two INT build columns estimate ~40MB/worker",
+            OpenSearchJoin.JoinAlgorithm.SORT_MERGE,
+            findWorkerJoinAlgorithm(wideResult)
+        );
+        assertEquals(
+            "one projected INT estimates ~20MB/worker\n" + org.apache.calcite.plan.RelOptUtil.toString(projectedResult),
+            OpenSearchJoin.JoinAlgorithm.HASH,
+            findWorkerJoinAlgorithm(projectedResult)
+        );
+        OpenSearchJoin workerJoin = findWorkerJoin(projectedResult);
+        assertNotNull(workerJoin);
+        assertTrue("CBO must retain the per-worker build byte estimate", workerJoin.getEstimatedBuildBytesPerWorker() < 30d * 1024 * 1024);
+    }
+
+    public void testFilterSelectivityCanChangeSortMergeToBroadcastHashJoin() {
+        Settings settings = Settings.builder()
+            .put("analytics.mpp.worker.sort_merge_join_min_rows", 5_000_000L)
+            .put("analytics.mpp.worker.hash_join_max_bytes", "1gb")
+            .put("analytics.mpp.broadcast.max_bytes", "20mb")
+            .build();
+        PlannerContext context = buildMppContext(
+            Map.of("big_left", 3, "big_right", 3),
+            Map.of("big_left", LARGE, "big_right", LARGE),
+            true,
+            settings
+        );
+
+        RelNode unfiltered = runPlanner(makeJoin(context, "big_left", "big_right", JoinRelType.INNER, true), context);
+        RelNode filtered = runPlanner(makeFilteredBuildJoin(context, "big_left", "big_right"), context);
+
+        assertEquals(OpenSearchJoin.JoinAlgorithm.SORT_MERGE, findWorkerJoinAlgorithm(unfiltered));
+        assertContainsBroadcastExchange("post-filter build size should fit the broadcast byte cap", filtered);
+        assertDoesNotContainShuffleExchange("a selective build should not keep the unfiltered SMJ strategy", filtered);
     }
 
     // ── Scenario 3: asymmetric sizes ───────────────────────────────────────
@@ -320,8 +395,17 @@ public class JoinStrategyCBOSelectionTests extends BasePlannerRulesTests {
      *  estimation; the shuffle-aware backend's defaultShuffleParallelism makes the hash
      *  rule's probeNodes > 1 gate pass. */
     private PlannerContext buildMppContext(Map<String, Integer> shardCounts, Map<String, Long> rowCounts, boolean mppEnabled) {
+        return buildMppContext(shardCounts, rowCounts, mppEnabled, Settings.EMPTY);
+    }
+
+    private PlannerContext buildMppContext(
+        Map<String, Integer> shardCounts,
+        Map<String, Long> rowCounts,
+        boolean mppEnabled,
+        Settings additionalSettings
+    ) {
         ClusterState state = mockClusterStateWithDataNodes(shardCounts);
-        Settings settings = Settings.builder().put("analytics.mpp.enabled", mppEnabled).build();
+        Settings settings = Settings.builder().put(additionalSettings).put("analytics.mpp.enabled", mppEnabled).build();
         ToLongFunction<String> rowCountLookup = name -> rowCounts.getOrDefault(name, PlannerContext.UNKNOWN_ROW_COUNT);
         Function<IndexMetadata, FieldStorageResolver> fieldStorageFactory = FieldStorageResolver::new;
         // Use a shuffle-aware DataFusion backend so OpenSearchHashJoinSplitRule's partitionCount
@@ -353,6 +437,42 @@ public class JoinStrategyCBOSelectionTests extends BasePlannerRulesTests {
                 rexBuilder.makeInputRef(intType, leftCols)
             );
         return LogicalJoin.create(leftScan, rightScan, List.of(), condition, Set.of(), joinType);
+    }
+
+    private RelNode makeProjectedBuildJoin(PlannerContext context, String leftIdx, String rightIdx) {
+        RelNode leftScan = stubScan(mockTable(leftIdx, "status", "size"));
+        RelNode rightScan = stubScan(mockTable(rightIdx, "status", "size"));
+        RelDataType intType = typeFactory.createSqlType(SqlTypeName.INTEGER);
+        RelNode projectedRight = LogicalProject.create(
+            rightScan,
+            List.of(),
+            List.of(rexBuilder.makeInputRef(intType, 0)),
+            List.of("status")
+        );
+        RexNode condition = rexBuilder.makeCall(
+            SqlStdOperatorTable.EQUALS,
+            rexBuilder.makeInputRef(intType, 0),
+            rexBuilder.makeInputRef(intType, leftScan.getRowType().getFieldCount())
+        );
+        return LogicalJoin.create(leftScan, projectedRight, List.of(), condition, Set.of(), JoinRelType.INNER);
+    }
+
+    private RelNode makeFilteredBuildJoin(PlannerContext context, String leftIdx, String rightIdx) {
+        RelNode leftScan = stubScan(mockTable(leftIdx, "status", "size"));
+        RelNode rightScan = stubScan(mockTable(rightIdx, "status", "size"));
+        RelDataType intType = typeFactory.createSqlType(SqlTypeName.INTEGER);
+        RexNode filterCondition = rexBuilder.makeCall(
+            SqlStdOperatorTable.EQUALS,
+            rexBuilder.makeInputRef(intType, 1),
+            rexBuilder.makeExactLiteral(java.math.BigDecimal.ONE)
+        );
+        RelNode filteredRight = LogicalFilter.create(rightScan, filterCondition);
+        RexNode joinCondition = rexBuilder.makeCall(
+            SqlStdOperatorTable.EQUALS,
+            rexBuilder.makeInputRef(intType, 0),
+            rexBuilder.makeInputRef(intType, leftScan.getRowType().getFieldCount())
+        );
+        return LogicalJoin.create(leftScan, filteredRight, List.of(), joinCondition, Set.of(), JoinRelType.INNER);
     }
 
     /** Build an INNER join whose condition is an equi key AND a residual non-equi predicate:
@@ -423,6 +543,23 @@ public class JoinStrategyCBOSelectionTests extends BasePlannerRulesTests {
             if (containsNodeOfType(input, type)) return true;
         }
         return false;
+    }
+
+    private static OpenSearchJoin findWorkerJoin(RelNode node) {
+        RelNode unwrapped = RelNodeUtils.unwrapHep(node);
+        if (unwrapped instanceof OpenSearchJoin join && join.getJoinAlgorithm() != OpenSearchJoin.JoinAlgorithm.AUTO) {
+            return join;
+        }
+        for (RelNode input : unwrapped.getInputs()) {
+            OpenSearchJoin found = findWorkerJoin(input);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    private static OpenSearchJoin.JoinAlgorithm findWorkerJoinAlgorithm(RelNode node) {
+        OpenSearchJoin join = findWorkerJoin(node);
+        return join == null ? OpenSearchJoin.JoinAlgorithm.AUTO : join.getJoinAlgorithm();
     }
 
     private static void assertContainsBroadcastExchange(String message, RelNode tree) {

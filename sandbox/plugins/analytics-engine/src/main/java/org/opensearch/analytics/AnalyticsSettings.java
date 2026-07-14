@@ -178,26 +178,39 @@ public final class AnalyticsSettings {
     );
 
     /**
-     * Build-side row threshold above which a hash-shuffle WORKER join uses a spillable sort-merge join
-     * instead of the in-memory hash-join build. When a worker join's build-side (right input) estimated
-     * scan rows exceed this value, the coordinator sets {@code prefer_hash_join=false} on that worker
-     * stage, so DataFusion's physical planner emits a {@code SortMergeJoinExec} (which spills its buffered
-     * batches to disk under memory pressure) rather than the {@code HashJoinExec} whose in-memory build
-     * has no escape to disk and trips the native circuit breaker on large builds (TPC-H sf=10 q17/q18/q21).
-     * This mirrors Spark's memory-safety rule: hash-join only when the build provably fits, else the
-     * spillable join.
+     * Build-side row safety budget for a hash-shuffle WORKER join. Volcano emits both hash and
+     * sort-merge physical alternatives; the hash alternative becomes ineligible when the filtered
+     * build estimate reaches this value, so the spillable sort-merge implementation wins. The selected
+     * algorithm is carried into the worker session's {@code prefer_hash_join}. Joins distributed only
+     * by the post-CBO enforcement pass retain the old scan-row comparison as an {@code AUTO} fallback.
      *
      * <p>Below the threshold the worker keeps the (faster, no-sort) hash join. Only worker joins are
      * affected — shard-scan and coordinator-reduce sessions always prefer hash join. Default
      * {@code 20_000_000}: above the dimension builds that fit comfortably in memory (TPC-H supplier 100K,
      * part 2M, partsupp 8M at sf=10) and below the fact-table-scale builds that OOM. Set to
      * {@code Long.MAX_VALUE} to disable (always hash join — the pre-SMJ behavior) or {@code 0} to force
-     * sort-merge on every worker join (A/B benchmarking).
+     * sort-merge on every explicit worker-join candidate (A/B benchmarking).
      */
     public static final Setting<Long> MPP_WORKER_SORT_MERGE_JOIN_MIN_ROWS = Setting.longSetting(
         "analytics.mpp.worker.sort_merge_join_min_rows",
         20_000_000L,
         0L,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
+     * Maximum estimated hash-table bytes per shuffle worker. The planner estimates the filtered,
+     * projected build as {@code rows * averageRowWidth / partitions}, adds a hash-table overhead,
+     * and makes the hash-join alternative ineligible when it exceeds this budget. The spillable
+     * sort-merge alternative then wins CBO. A value of {@code 0b} disables only this byte gate; the
+     * row gate above remains available for A/B control.
+     */
+    public static final Setting<ByteSizeValue> MPP_WORKER_HASH_JOIN_MAX_BYTES = Setting.byteSizeSetting(
+        "analytics.mpp.worker.hash_join_max_bytes",
+        new ByteSizeValue(512L * 1024 * 1024),
+        new ByteSizeValue(0L),
+        new ByteSizeValue(Long.MAX_VALUE),
         Setting.Property.NodeScope,
         Setting.Property.Dynamic
     );
@@ -366,6 +379,7 @@ public final class AnalyticsSettings {
         MPP_DISTRIBUTE_MIN_ROWS,
         MPP_JOIN_REORDER,
         MPP_WORKER_SORT_MERGE_JOIN_MIN_ROWS,
+        MPP_WORKER_HASH_JOIN_MAX_BYTES,
         MPP_SHUFFLE_SPILL_ENABLED,
         MPP_SHUFFLE_SPILL_DIRECTORY,
         MPP_SHUFFLE_SPILL_MAX_BYTES,

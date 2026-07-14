@@ -12,6 +12,7 @@ import org.opensearch.analytics.planner.CapabilityRegistry;
 import org.opensearch.analytics.planner.dag.ExchangeInfo;
 import org.opensearch.analytics.planner.dag.Stage;
 import org.opensearch.analytics.planner.dag.StagePlan;
+import org.opensearch.analytics.planner.rel.OpenSearchJoin;
 import org.opensearch.analytics.spi.AnalyticsSearchBackendPlugin;
 import org.opensearch.analytics.spi.BackendCapabilityProvider;
 import org.opensearch.analytics.spi.DataTransferCapability;
@@ -177,6 +178,17 @@ public class ShuffleEnrichmentTests extends OpenSearchTestCase {
         assertEquals("qid", setup.getQueryId());
         assertEquals(4, setup.getTargetStageId());
         assertFalse("preferHashJoin flows through to the setup placeholder", setup.getPreferHashJoin());
+    }
+
+    public void testExplicitCboJoinAlgorithmOverridesAutoFallback() {
+        OpenSearchJoin hash = mock(OpenSearchJoin.class);
+        when(hash.getJoinAlgorithm()).thenReturn(OpenSearchJoin.JoinAlgorithm.HASH);
+        OpenSearchJoin sortMerge = mock(OpenSearchJoin.class);
+        when(sortMerge.getJoinAlgorithm()).thenReturn(OpenSearchJoin.JoinAlgorithm.SORT_MERGE);
+
+        assertEquals(OpenSearchJoin.JoinAlgorithm.HASH, ShuffleEnrichment.workerJoinAlgorithm(hash));
+        assertEquals(OpenSearchJoin.JoinAlgorithm.SORT_MERGE, ShuffleEnrichment.workerJoinAlgorithm(sortMerge));
+        assertEquals(OpenSearchJoin.JoinAlgorithm.AUTO, ShuffleEnrichment.workerJoinAlgorithm(null));
     }
 
     private static Stage newProducerStage(int stageId, int partitionCount, List<Integer> hashKeys) {

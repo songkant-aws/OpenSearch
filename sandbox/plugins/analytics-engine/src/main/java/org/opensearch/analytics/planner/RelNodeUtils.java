@@ -118,7 +118,12 @@ public class RelNodeUtils {
                 newInputs.get(1),
                 join.getCondition(),
                 join.getJoinType(),
-                join.getViableBackends()
+                join.getViableBackends(),
+                join.getJoinAlgorithm(),
+                join.getEstimatedBuildRows(),
+                join.getEstimatedBuildBytesPerWorker(),
+                join.getHashJoinMaxBuildRows(),
+                join.getHashJoinMaxBytesPerWorker()
             );
         } else if (node instanceof OpenSearchUnion union) {
             return new OpenSearchUnion(newCluster, newTraits, newInputs, union.all, union.getViableBackends());

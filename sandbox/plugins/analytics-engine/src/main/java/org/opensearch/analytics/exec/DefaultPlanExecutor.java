@@ -381,6 +381,16 @@ public class DefaultPlanExecutor extends HandledTransportAction<AnalyticsQueryRe
             // Join reordering is read live by PlannerImpl.reorderJoins via PlannerContext settings; overlay
             // it so a dynamic PUT /_cluster/settings toggle is honored (else it pins the node-bootstrap default).
             .put(AnalyticsSettings.MPP_JOIN_REORDER.getKey(), clusterService.getClusterSettings().get(AnalyticsSettings.MPP_JOIN_REORDER))
+            // HJ/SMJ alternatives are costed during planning, so both dynamic memory-safety
+            // thresholds must be captured in the same per-query settings snapshot.
+            .put(
+                AnalyticsSettings.MPP_WORKER_SORT_MERGE_JOIN_MIN_ROWS.getKey(),
+                clusterService.getClusterSettings().get(AnalyticsSettings.MPP_WORKER_SORT_MERGE_JOIN_MIN_ROWS)
+            )
+            .put(
+                AnalyticsSettings.MPP_WORKER_HASH_JOIN_MAX_BYTES.getKey(),
+                clusterService.getClusterSettings().get(AnalyticsSettings.MPP_WORKER_HASH_JOIN_MAX_BYTES)
+            )
             .build();
         // Reuse the snapshot captured at REST entry when present; this is the same ClusterState
         // OpenSearchSchemaBuilder used to build the SchemaPlus, so planner and schema agree.
@@ -665,9 +675,9 @@ public class DefaultPlanExecutor extends HandledTransportAction<AnalyticsQueryRe
         // broadcast instruction on its consumer stage, then dispatches the broadcast-free DAG (shuffle
         // promotion if it still distributes a join). Broadcast is an instruction, not a stage role, so a
         // stage that is both a broadcast consumer AND a shuffle producer (q3/q8/q9) runs without conflict.
-        // Read the worker sort-merge-join floor live (dynamic-aware) so a PUT /_cluster/settings update
-        // takes effect without a restart; UnifiedDispatch hands it to ShuffleEnrichment, which sets
-        // prefer_hash_join=false on a worker join whose estimated build exceeds it.
+        // Read the worker sort-merge-join floor live for the AUTO compatibility path. Explicit
+        // HJ/SMJ candidates already carry CBO's decision in the fragment; only joins distributed
+        // after CBO use this fallback threshold.
         long sortMergeJoinMinRows = clusterService.getClusterSettings().get(AnalyticsSettings.MPP_WORKER_SORT_MERGE_JOIN_MIN_ROWS);
         new UnifiedDispatch(qscheduler, clusterService, capabilityRegistry, preferMetadataDriver, sortMergeJoinMinRows).run(
             context,
