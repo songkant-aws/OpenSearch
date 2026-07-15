@@ -468,11 +468,16 @@ pub async unsafe fn create_worker_session_context(
     // (spillable) SortExecs the SMJ needs.
     config.options_mut().optimizer.prefer_hash_join = query_config.prefer_hash_join;
 
+    let mut physical_optimizer_rules = crate::agg_mode::physical_optimizer_rules_without_combine();
+    physical_optimizer_rules.push(Arc::new(
+        crate::spillable_hash_join::SpillableHashJoinOptimizer,
+    ));
+
     let state = SessionStateBuilder::new()
         .with_config(config)
         .with_runtime_env(Arc::from(runtime_env))
         .with_default_features()
-        .with_physical_optimizer_rules(crate::agg_mode::physical_optimizer_rules_without_combine())
+        .with_physical_optimizer_rules(physical_optimizer_rules)
         .build();
 
     let ctx = SessionContext::new_with_state(state);

@@ -48,6 +48,7 @@ pub mod runtime_manager;
 pub mod schema_coerce;
 pub mod session_context;
 pub mod shard_table_provider;
+pub mod spillable_hash_join;
 
 pub mod native_node_stats;
 pub mod scoped_index_optimizer;

@@ -21,6 +21,26 @@ import java.util.concurrent.TimeUnit;
 
 public class ShuffleBufferManagerTests extends OpenSearchTestCase {
 
+    public void testPartitionStatsTrackReceivedAndSpilledChunks() throws Exception {
+        Path spillDir = createTempDir();
+        ShuffleBufferManager mgr = new ShuffleBufferManager();
+        mgr.setBudgets(10, 10);
+        mgr.setSpillConfig(true, spillDir, 1_000);
+        ShuffleBufferManager.ShuffleBuffer buffer = mgr.getOrCreateBuffer("stats", 0, 0);
+
+        assertEquals(ShuffleBufferManager.AdmitResult.ACCEPTED, mgr.tryAdmit("stats", 0, 0, "left", new byte[8]));
+        assertEquals(ShuffleBufferManager.AdmitResult.ACCEPTED, mgr.tryAdmit("stats", 0, 0, "left", new byte[8]));
+
+        ShuffleBufferManager.ShuffleBuffer.PartitionStats stats = buffer.partitionStats();
+        assertEquals(16L, stats.receivedBytes());
+        assertEquals(2L, stats.receivedChunks());
+        assertTrue(stats.spilledPayloadBytes() > 0L);
+        assertTrue(stats.spilledChunks() > 0L);
+        assertTrue(stats.residentBytes() <= 10L);
+        assertFalse(stats.draining());
+        mgr.clearForQuery("stats");
+    }
+
     public void testGetOrCreateReturnsStableBuffer() {
         ShuffleBufferManager mgr = new ShuffleBufferManager();
         ShuffleBufferManager.ShuffleBuffer a = mgr.getOrCreateBuffer("q1", 0, 0);

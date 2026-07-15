@@ -22,13 +22,14 @@
 //! Java feeder thread blocks on `send_blocking`, which naturally stalls the
 //! shard response pipeline.
 //!
-//! # Single-consumer contract
+//! # Spill-backed replay
 //!
-//! [`SingleReceiverPartition::execute`] hands out the receiver exactly once. Any
-//! subsequent `execute()` call on the same partition returns an already-closed
-//! empty stream rather than panicking — matches the "take once, then empty"
-//! contract expected by DataFusion's `StreamingTable` when a partition is
-//! re-executed.
+//! When the DataFusion disk manager is enabled, the first execution forwards
+//! every incoming batch immediately and writes the same batch to a spill file.
+//! Once EOF is reached, later sequential executions replay that completed file.
+//! This keeps first-pass exchange consumption streaming while making the local
+//! shuffle partition durable enough to be re-read by adaptive operators. When
+//! spill is disabled, the historical one-shot behavior is preserved.
 
 use std::fmt;
 use std::pin::Pin;
@@ -38,13 +39,17 @@ use std::task::{Context, Poll};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::DataFusionError;
+use datafusion::execution::disk_manager::RefCountedTempFile;
 use datafusion::execution::{RecordBatchStream, TaskContext};
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, SpillMetrics};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::PartitionStream;
 use datafusion::physical_plan::SendableRecordBatchStream;
-use futures::{stream, Stream};
+use datafusion::physical_plan::SpillManager;
+use futures::{stream, Stream, StreamExt};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 /// Bounded channel capacity. Small by design — producers back-pressure when the
 /// DataFusion execute side falls behind.
@@ -220,6 +225,17 @@ pub fn channel(schema: SchemaRef) -> (PartitionStreamSender, PartitionStreamRece
 pub(crate) struct SingleReceiverPartition {
     schema: SchemaRef,
     receiver: Mutex<Option<PartitionStreamReceiver>>,
+    replay: Arc<Mutex<ReplayState>>,
+    metrics: ExecutionPlanMetricsSet,
+}
+
+#[derive(Debug)]
+enum ReplayState {
+    Unopened,
+    Active,
+    Replayable(Option<RefCountedTempFile>),
+    OneShotConsumed,
+    Poisoned(String),
 }
 
 impl SingleReceiverPartition {
@@ -227,6 +243,8 @@ impl SingleReceiverPartition {
         Self {
             schema: Arc::clone(&receiver.schema),
             receiver: Mutex::new(Some(receiver)),
+            replay: Arc::new(Mutex::new(ReplayState::Unopened)),
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 }
@@ -244,24 +262,151 @@ impl PartitionStream for SingleReceiverPartition {
         &self.schema
     }
 
-    fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+    fn execute(&self, ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+        let mut replay = self.replay.lock().expect("partition replay mutex poisoned");
+        match &*replay {
+            ReplayState::Replayable(file) => {
+                let manager = SpillManager::new(
+                    ctx.runtime_env(),
+                    SpillMetrics::new(&self.metrics, 0),
+                    Arc::clone(&self.schema),
+                );
+                return match file {
+                    Some(file) => match manager.read_spill_as_stream(file.clone(), None) {
+                        Ok(stream) => stream,
+                        Err(error) => error_stream(Arc::clone(&self.schema), error),
+                    },
+                    None => empty_stream(Arc::clone(&self.schema)),
+                };
+            }
+            ReplayState::Active => {
+                return error_stream(
+                    Arc::clone(&self.schema),
+                    DataFusionError::Execution(
+                        "shuffle partition replay requested while the first pass is active"
+                            .to_string(),
+                    ),
+                );
+            }
+            ReplayState::Poisoned(reason) => {
+                return error_stream(
+                    Arc::clone(&self.schema),
+                    DataFusionError::Execution(format!(
+                        "shuffle partition is not replayable: {reason}"
+                    )),
+                );
+            }
+            ReplayState::OneShotConsumed => return empty_stream(Arc::clone(&self.schema)),
+            ReplayState::Unopened => {}
+        }
+
         let taken = self
             .receiver
             .lock()
             .expect("partition mutex poisoned")
             .take();
-        match taken {
-            Some(receiver) => Box::pin(receiver),
-            None => {
-                // Second+ execute: hand back an already-closed empty stream so
-                // DataFusion sees the partition as drained.
-                Box::pin(RecordBatchStreamAdapter::new(
-                    Arc::clone(&self.schema),
-                    stream::empty(),
-                ))
-            }
+        let Some(receiver) = taken else {
+            *replay = ReplayState::Poisoned("missing first-pass receiver".to_string());
+            return error_stream(
+                Arc::clone(&self.schema),
+                DataFusionError::Internal(
+                    "shuffle partition missing first-pass receiver".to_string(),
+                ),
+            );
+        };
+
+        if ctx.runtime_env().disk_manager.tmp_files_enabled() == false {
+            *replay = ReplayState::OneShotConsumed;
+            return Box::pin(receiver);
         }
+
+        let manager = SpillManager::new(
+            ctx.runtime_env(),
+            SpillMetrics::new(&self.metrics, 0),
+            Arc::clone(&self.schema),
+        );
+        let mut writer = match manager.create_in_progress_file("replayable shuffle partition") {
+            Ok(writer) => writer,
+            Err(error) => {
+                *replay = ReplayState::Poisoned(error.to_string());
+                return error_stream(Arc::clone(&self.schema), error);
+            }
+        };
+
+        let (tx, output) = mpsc::channel(CHANNEL_CAPACITY);
+        let shared_state = Arc::clone(&self.replay);
+        *replay = ReplayState::Active;
+        drop(replay);
+
+        tokio::spawn(async move {
+            let mut input = Box::pin(receiver);
+            while let Some(item) = input.next().await {
+                match item {
+                    Ok(batch) => {
+                        if batch.num_rows() > 0 {
+                            if let Err(error) = writer.append_batch(&batch) {
+                                let reason = error.to_string();
+                                let _ = tx.send(Err(error)).await;
+                                *shared_state
+                                    .lock()
+                                    .expect("partition replay mutex poisoned") =
+                                    ReplayState::Poisoned(reason);
+                                return;
+                            }
+                        }
+                        if tx.send(Ok(batch)).await.is_err() {
+                            *shared_state
+                                .lock()
+                                .expect("partition replay mutex poisoned") = ReplayState::Poisoned(
+                                "first-pass consumer stopped before exchange EOF".to_string(),
+                            );
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let reason = error.to_string();
+                        let _ = tx.send(Err(error)).await;
+                        *shared_state
+                            .lock()
+                            .expect("partition replay mutex poisoned") =
+                            ReplayState::Poisoned(reason);
+                        return;
+                    }
+                }
+            }
+
+            match writer.finish() {
+                Ok(file) => {
+                    *shared_state
+                        .lock()
+                        .expect("partition replay mutex poisoned") = ReplayState::Replayable(file);
+                }
+                Err(error) => {
+                    let reason = error.to_string();
+                    let _ = tx.send(Err(error)).await;
+                    *shared_state
+                        .lock()
+                        .expect("partition replay mutex poisoned") = ReplayState::Poisoned(reason);
+                }
+            }
+        });
+
+        Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&self.schema),
+            ReceiverStream::new(output),
+        ))
     }
+}
+
+fn empty_stream(schema: SchemaRef) -> SendableRecordBatchStream {
+    Box::pin(RecordBatchStreamAdapter::new(schema, stream::empty()))
+}
+
+fn error_stream(schema: SchemaRef, error: DataFusionError) -> SendableRecordBatchStream {
+    Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        stream::once(async move { Err(error) }),
+    ))
 }
 
 #[cfg(test)]
@@ -406,7 +551,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_receiver_partition_executes_once_then_empty() {
+    async fn single_receiver_partition_replays_after_first_pass() {
         let schema = test_schema();
         let (sender, receiver) = channel(Arc::clone(&schema));
         let partition = SingleReceiverPartition::new(receiver);
@@ -429,8 +574,20 @@ mod tests {
         assert!(first.next().await.is_none());
         producer.await.unwrap();
 
-        // Second execute() must not panic and must yield an empty stream.
+        // The first pass is simultaneously persisted. A later pass reads the
+        // completed spill file and yields the same partition again.
         let mut second = partition.execute(ctx);
+        let replayed = second.next().await.unwrap().unwrap();
+        assert_eq!(replayed.num_rows(), 1);
+        assert_eq!(
+            replayed
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            42
+        );
         assert!(second.next().await.is_none());
     }
 }

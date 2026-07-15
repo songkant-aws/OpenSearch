@@ -795,6 +795,10 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
         private final CountDownLatch rightReady = new CountDownLatch(1);
         private final AtomicLong currentBytes = new AtomicLong();
         private final AtomicLong rejectedCount = new AtomicLong();
+        private final AtomicLong receivedBytes = new AtomicLong();
+        private final AtomicLong receivedChunks = new AtomicLong();
+        private final AtomicLong spilledPayloadBytes = new AtomicLong();
+        private final AtomicLong spilledChunks = new AtomicLong();
 
         /**
          * Spill state. Null/disabled by default — a buffer only spills when the manager wires its
@@ -868,6 +872,8 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
         public void addData(String side, byte[] data) {
             int size = data == null ? 0 : data.length;
             currentBytes.addAndGet(size);
+            receivedBytes.addAndGet(size);
+            receivedChunks.incrementAndGet();
             List<byte[]> target = "left".equals(side) ? leftData : rightData;
             ReentrantLock dataLock = dataLockFor(side);
             dataLock.lock();
@@ -890,6 +896,23 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
 
         public long getRejectedCount() {
             return rejectedCount.get();
+        }
+
+        /** Immutable per-partition exchange counters for diagnostics and benchmark assertions. */
+        public PartitionStats partitionStats() {
+            return new PartitionStats(
+                receivedBytes.get(),
+                receivedChunks.get(),
+                currentBytes.get(),
+                spilledPayloadBytes.get(),
+                spilledChunks.get(),
+                rejectedCount.get(),
+                draining
+            );
+        }
+
+        public record PartitionStats(long receivedBytes, long receivedChunks, long residentBytes, long spilledPayloadBytes,
+            long spilledChunks, long rejectedCount, boolean draining) {
         }
 
         /**
@@ -957,6 +980,8 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
                 try {
                     SpilledSide spill = spillFor(side);
                     spill.append(chunk);
+                    spilledPayloadBytes.addAndGet(len);
+                    spilledChunks.incrementAndGet();
                 } catch (IOException e) {
                     // The disk bytes for THIS chunk were reserved (reserveSpillBytes above) but the
                     // write failed, so they were never recorded in SpilledSide.bytesOnDisk() and the
