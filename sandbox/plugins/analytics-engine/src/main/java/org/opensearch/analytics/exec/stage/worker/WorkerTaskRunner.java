@@ -56,7 +56,7 @@ public final class WorkerTaskRunner implements TaskRunner<WorkerStageTask> {
         transport.dispatchWorkerFragmentStreaming(
             request,
             target.node(),
-            stage.responseListenerFor(listener),
+            stage.responseListenerFor(task, listener),
             config.parentTask(),
             pending
         );

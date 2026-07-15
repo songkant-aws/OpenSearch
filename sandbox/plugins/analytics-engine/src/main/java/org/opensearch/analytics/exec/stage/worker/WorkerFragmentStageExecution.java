@@ -118,7 +118,7 @@ public class WorkerFragmentStageExecution extends AbstractStageExecution impleme
      * the {@code isLast} marker, and the stage-terminal short-circuit closes any post-terminal
      * batches.
      */
-    StreamingResponseListener<FragmentExecutionArrowResponse> responseListenerFor(ActionListener<Void> listener) {
+    StreamingResponseListener<FragmentExecutionArrowResponse> responseListenerFor(WorkerStageTask task, ActionListener<Void> listener) {
         return new StreamingResponseListener<>() {
             @Override
             public boolean onStreamResponse(FragmentExecutionArrowResponse response, boolean isLast) {
@@ -146,6 +146,13 @@ public class WorkerFragmentStageExecution extends AbstractStageExecution impleme
                 metrics.addRowsProcessed(vsr.getRowCount());
                 if (isLast) listener.onResponse(null);
                 return true;
+            }
+
+            @Override
+            public void onStreamComplete(byte[] trailingMetadata) {
+                if (trailingMetadata != null) {
+                    task.setDataNodeMetrics(trailingMetadata);
+                }
             }
 
             @Override
