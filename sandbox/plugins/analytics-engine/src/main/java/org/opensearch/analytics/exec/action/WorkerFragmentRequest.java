@@ -25,7 +25,7 @@ import java.util.Map;
  * Transport request for a hash-shuffle worker fragment. Carries the per-task plan alternatives
  * and partition index — no {@code shardId}, since a worker fragment never scans a shard.
  *
- * <p>Wire shape: {@code (queryId, stageId, partitionIndex, planAlternatives)}. The
+ * <p>Wire shape: {@code (queryId, stageId, partitionIndex, planAlternatives, profile)}. The
  * data-node-side handler in {@code AnalyticsSearchTransportService} routes this to
  * {@code AnalyticsSearchService.executeWorkerFragmentStreamingAsync}, which skips
  * {@code IndicesService.getShard} and reader acquisition entirely.
@@ -38,17 +38,20 @@ public class WorkerFragmentRequest extends ActionRequest {
     private final int stageId;
     private final int partitionIndex;
     private final List<FragmentExecutionRequest.PlanAlternative> planAlternatives;
+    private final boolean profile;
 
     public WorkerFragmentRequest(
         String queryId,
         int stageId,
         int partitionIndex,
-        List<FragmentExecutionRequest.PlanAlternative> planAlternatives
+        List<FragmentExecutionRequest.PlanAlternative> planAlternatives,
+        boolean profile
     ) {
         this.queryId = queryId;
         this.stageId = stageId;
         this.partitionIndex = partitionIndex;
         this.planAlternatives = planAlternatives;
+        this.profile = profile;
     }
 
     public WorkerFragmentRequest(StreamInput in) throws IOException {
@@ -61,6 +64,7 @@ public class WorkerFragmentRequest extends ActionRequest {
         for (int i = 0; i < n; i++) {
             planAlternatives.add(new FragmentExecutionRequest.PlanAlternative(in));
         }
+        this.profile = in.readBoolean();
     }
 
     @Override
@@ -73,6 +77,7 @@ public class WorkerFragmentRequest extends ActionRequest {
         for (FragmentExecutionRequest.PlanAlternative alt : planAlternatives) {
             alt.writeTo(out);
         }
+        out.writeBoolean(profile);
     }
 
     public String getQueryId() {
@@ -89,6 +94,10 @@ public class WorkerFragmentRequest extends ActionRequest {
 
     public List<FragmentExecutionRequest.PlanAlternative> getPlanAlternatives() {
         return planAlternatives;
+    }
+
+    public boolean isProfile() {
+        return profile;
     }
 
     @Override

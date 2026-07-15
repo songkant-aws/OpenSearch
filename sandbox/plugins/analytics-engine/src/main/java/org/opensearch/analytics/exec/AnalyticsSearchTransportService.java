@@ -40,8 +40,6 @@ import org.opensearch.transport.TransportException;
 import org.opensearch.transport.TransportRequest;
 import org.opensearch.transport.TransportRequestOptions;
 import org.opensearch.transport.TransportResponseHandler;
-import org.opensearch.transport.stream.StreamErrorCode;
-import org.opensearch.transport.stream.StreamException;
 import org.opensearch.transport.stream.StreamTransportResponse;
 
 import java.io.IOException;
@@ -130,27 +128,7 @@ public class AnalyticsSearchTransportService {
             (request, channel, task) -> searchService.executeWorkerFragmentStreamingAsync(
                 request,
                 (AnalyticsShardTask) task,
-                new AnalyticsSearchService.StreamingFragmentResponseHandler() {
-                    @Override
-                    public void onBatch(EngineResultBatch batch) throws Exception {
-                        channel.sendResponseBatch(new FragmentExecutionArrowResponse(batch.getArrowRoot()));
-                    }
-
-                    @Override
-                    public void onComplete() {
-                        channel.completeStream();
-                    }
-
-                    @Override
-                    public void onFailure(Exception e) {
-                        if (e instanceof StreamException se && se.getErrorCode() == StreamErrorCode.CANCELLED) {
-                            return;
-                        }
-                        try {
-                            channel.sendResponse(e);
-                        } catch (Exception ignored) {}
-                    }
-                },
+                channelResponseHandler(channel),
                 transportService.getThreadPool().executor(ThreadPool.Names.SEARCH)
             )
         );
@@ -288,85 +266,7 @@ public class AnalyticsSearchTransportService {
         Task parentTask,
         PendingExecutions pending
     ) {
-        TransportResponseHandler<FragmentExecutionArrowResponse> handler = new TransportResponseHandler<>() {
-            @Override
-            public FragmentExecutionArrowResponse read(StreamInput in) throws IOException {
-                return new FragmentExecutionArrowResponse(in);
-            }
-
-            @Override
-            public boolean skipsDeserialization() {
-                return true;
-            }
-
-            @Override
-            public String executor() {
-                return ThreadPool.Names.SAME;
-            }
-
-            @Override
-            public void handleStreamResponse(StreamTransportResponse<FragmentExecutionArrowResponse> stream) {
-                try {
-                    FragmentExecutionArrowResponse current;
-                    FragmentExecutionArrowResponse last = null;
-                    while ((current = stream.nextResponse()) != null) {
-                        if (last != null) {
-                            listener.onStreamResponse(last, false);
-                        }
-                        last = current;
-                    }
-                    if (last != null) {
-                        listener.onStreamResponse(last, true);
-                    } else {
-                        // Worker fragments may have an empty response stream when their output
-                        // is fully consumed by the coord-reduce sink rather than streamed back.
-                        // Synthesize a final null-payload, isLast=true response so the
-                        // coordinator's stage-execution listener fires onResponse(null) and the
-                        // stage transitions to SUCCEEDED.
-                        listener.onStreamResponse(new FragmentExecutionArrowResponse((VectorSchemaRoot) null), true);
-                    }
-                } catch (Exception e) {
-                    listener.onFailure(e);
-                } finally {
-                    try {
-                        stream.close();
-                    } catch (Exception ignore) {}
-                    pending.finishAndRunNext();
-                }
-            }
-
-            @Override
-            public void handleResponse(FragmentExecutionArrowResponse response) {
-                try {
-                    listener.onStreamResponse(response, true);
-                } finally {
-                    pending.finishAndRunNext();
-                }
-            }
-
-            @Override
-            public void handleException(TransportException e) {
-                try {
-                    listener.onFailure(e);
-                } finally {
-                    pending.finishAndRunNext();
-                }
-            }
-        };
-
-        TransportRequestOptions options = TransportRequestOptions.builder().withType(TransportRequestOptions.Type.STREAM).build();
-        pending.tryRun(() -> {
-            try {
-                Transport.Connection connection = getConnection(targetNode);
-                transportService.sendChildRequest(connection, WorkerFragmentExecutionAction.NAME, request, parentTask, options, handler);
-            } catch (Exception e) {
-                try {
-                    listener.onFailure(e);
-                } finally {
-                    pending.finishAndRunNext();
-                }
-            }
-        });
+        dispatchStreaming(WorkerFragmentExecutionAction.NAME, request, targetNode, listener, parentTask, pending);
     }
 
     public void dispatchFragmentStreaming(

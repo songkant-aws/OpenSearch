@@ -53,7 +53,7 @@ public final class WorkerFragmentStageExecutionFactory implements StageExecution
         Function<WorkerExecutionTarget, WorkerFragmentRequest> requestBuilder = target -> {
             int partitionIndex = target.partitionIndex();
             List<FragmentExecutionRequest.PlanAlternative> filtered = filterPlanAlternativesForPartition(stage, partitionIndex);
-            return new WorkerFragmentRequest(queryId, stageId, partitionIndex, filtered);
+            return new WorkerFragmentRequest(queryId, stageId, partitionIndex, filtered, config.profile());
         };
         return new WorkerFragmentStageExecution(stage, config, sink, clusterService, requestBuilder, transport);
     }

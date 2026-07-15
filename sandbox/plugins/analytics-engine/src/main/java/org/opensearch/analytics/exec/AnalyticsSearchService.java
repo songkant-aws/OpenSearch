@@ -487,12 +487,20 @@ public class AnalyticsSearchService implements AutoCloseable {
                         // a single header-only frame on the coordinator-bound stream (mirrors the shard
                         // producer path). drainIntoPartitionedSink closes the sink when done.
                         drainIntoPartitionedSink(partitionedSink, stream, responseHandler);
-                        responseHandler.onComplete();
                     } else {
                         Iterator<EngineResultBatch> it = stream.iterator();
                         while (it.hasNext()) {
                             responseHandler.onBatch(it.next());
                         }
+                    }
+                    if (request.isProfile() && stream instanceof FragmentResources.MetricsCapable metricsCapable) {
+                        byte[] metrics = metricsCapable.getMetricsJson();
+                        if (metrics != null) {
+                            responseHandler.onCompleteWithMetrics(metrics);
+                        } else {
+                            responseHandler.onComplete();
+                        }
+                    } else {
                         responseHandler.onComplete();
                     }
                 } catch (Exception e) {

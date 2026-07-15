@@ -19,6 +19,7 @@ import org.opensearch.analytics.planner.dag.WorkerExecutionTarget;
 import org.opensearch.analytics.spi.ExchangeSink;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -29,6 +30,20 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 public class WorkerFragmentStageExecutionTests extends OpenSearchTestCase {
+
+    public void testWorkerRequestPreservesProfileFlagOnWire() throws Exception {
+        WorkerFragmentRequest request = new WorkerFragmentRequest("query", 2, 1, List.of(), true);
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            request.writeTo(out);
+            try (var in = out.bytes().streamInput()) {
+                WorkerFragmentRequest restored = new WorkerFragmentRequest(in);
+                assertTrue(restored.isProfile());
+                assertEquals("query", restored.getQueryId());
+                assertEquals(2, restored.getStageId());
+                assertEquals(1, restored.getPartitionIndex());
+            }
+        }
+    }
 
     public void testTrailingMetricsAreAttachedToWorkerTask() {
         Stage stage = mock(Stage.class);
