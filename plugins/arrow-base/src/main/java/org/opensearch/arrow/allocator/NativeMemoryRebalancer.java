@@ -14,6 +14,7 @@ import org.apache.logging.log4j.message.ParameterizedMessage;
 import org.opensearch.arrow.spi.PoolGroup;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Supplier;
@@ -24,7 +25,8 @@ import java.util.function.Supplier;
  * <p>Algorithm:
  * <ul>
  *   <li>Pools start at their configured max on registration</li>
- *   <li>If no pool is under pressure, return early (no-op)</li>
+ *   <li>If no pool is under pressure, borrowed capacity converges back toward
+ *       the configured maxes without dropping a pool below its live allocation</li>
  *   <li>Idle pools (utilization &lt; idle_threshold) are shrunk, never below min</li>
  *   <li>Pressured pools (utilization &gt; pressure_threshold) receive freed capacity, can exceed max</li>
  *   <li>Excess freed capacity is returned to idle pools proportionally</li>
@@ -124,7 +126,8 @@ public class NativeMemoryRebalancer implements Runnable {
             snapshots.put(name, new PoolSnapshot(allocated, effectiveLimit, min, max, utilization));
         }
 
-        // Identify pressured pools — if none, nothing to do
+        // Identify pressured pools. If pressure has subsided, return borrowed
+        // capacity toward the pools' configured limits.
         Map<String, Long> desires = new HashMap<>();
         long totalDesired = 0;
         for (var entry : snapshots.entrySet()) {
@@ -136,7 +139,13 @@ public class NativeMemoryRebalancer implements Runnable {
             }
         }
         if (totalDesired == 0) {
-            logger.debug("Rebalancer: no pools under pressure, skipping");
+            if (restoreConfiguredLimits(snapshots, budget)) {
+                for (PoolGroup group : PoolGroup.values()) {
+                    allocator.firePoolGroupListeners(group);
+                }
+            } else {
+                logger.debug("Rebalancer: no pools under pressure and limits already normalized");
+            }
             return;
         }
 
@@ -194,6 +203,61 @@ public class NativeMemoryRebalancer implements Runnable {
     }
 
     // ─── Private helpers ─────────────────────────────────────────────────────────
+
+    /**
+     * Returns borrowed capacity after pressure has subsided.
+     *
+     * <p>A pressure tick may leave one pool above its configured max and another
+     * below it. The old no-pressure fast return made that state permanent, so an
+     * idle DataFusion pool could remain at {@code max * shrinkFactor^N} until the
+     * node restarted. Normalize in two phases while preserving the node budget:
+     * first reclaim above-max capacity, but never below the pool's live allocation;
+     * then distribute the resulting headroom proportionally across below-max pools.
+     */
+    private boolean restoreConfiguredLimits(Map<String, PoolSnapshot> snapshots, long budget) {
+        boolean changed = false;
+        long totalEffective = 0;
+
+        for (var entry : snapshots.entrySet()) {
+            PoolSnapshot s = entry.getValue();
+            long safeTarget = Math.max(s.max, s.allocated);
+            if (s.effectiveLimit > safeTarget) {
+                allocator.setPoolEffectiveLimit(entry.getKey(), safeTarget);
+                s.effectiveLimit = safeTarget;
+                changed = true;
+            }
+            totalEffective = Math.addExact(totalEffective, s.effectiveLimit);
+        }
+
+        long available = Math.max(0, budget - totalEffective);
+        List<Map.Entry<String, PoolSnapshot>> deficits = snapshots.entrySet()
+            .stream()
+            .filter(entry -> entry.getValue().effectiveLimit < entry.getValue().max)
+            .sorted(Map.Entry.comparingByKey())
+            .toList();
+        long remainingDeficit = deficits.stream().mapToLong(entry -> entry.getValue().max - entry.getValue().effectiveLimit).sum();
+
+        for (var entry : deficits) {
+            if (available == 0 || remainingDeficit == 0) {
+                break;
+            }
+            PoolSnapshot s = entry.getValue();
+            long deficit = s.max - s.effectiveLimit;
+            long grant = remainingDeficit <= available
+                ? deficit
+                : Math.min(deficit, (long) ((double) available * deficit / remainingDeficit));
+            if (grant > 0) {
+                long newLimit = s.effectiveLimit + grant;
+                allocator.setPoolEffectiveLimit(entry.getKey(), newLimit);
+                s.effectiveLimit = newLimit;
+                available -= grant;
+                changed = true;
+            }
+            remainingDeficit -= deficit;
+        }
+
+        return changed;
+    }
 
     private void returnToIdlePools(Map<String, PoolSnapshot> snapshots, long capacity) {
         long totalIdleSize = 0;

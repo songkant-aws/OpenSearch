@@ -15,6 +15,8 @@ import org.apache.calcite.plan.hep.HepRelVertex;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.JoinRelType;
 import org.apache.calcite.rel.logical.LogicalJoin;
+import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.rex.RexUtil;
 import org.opensearch.analytics.planner.PlannerContext;
 import org.opensearch.analytics.planner.RelNodeUtils;
 import org.opensearch.analytics.planner.rel.OpenSearchDistributionTraitDef;
@@ -93,12 +95,18 @@ public class OpenSearchJoinRule extends RelOptRule {
         // Leave strategy unresolved. Top-down passThroughTraits can satisfy a coordinator
         // demand, while the broadcast/hash rules add their own physical alternatives.
         RelTraitSet joinTraits = leftUnwrapped.getTraitSet().replace(distTraitDef.any());
+        // Pull predicates shared by every OR branch to the top-level conjunction before
+        // the split rules call JoinInfo.analyzeCondition(). TPC-H q19 expresses the same
+        // equi key in three OR branches; without this normalization Calcite reports no
+        // left/right join keys, so both broadcast and hash-shuffle incorrectly treat the
+        // join as pure theta and coordinator-centric becomes the only legal alternative.
+        RexNode normalizedCondition = RexUtil.pullFactors(join.getCluster().getRexBuilder(), join.getCondition());
         OpenSearchJoin osJoin = new OpenSearchJoin(
             join.getCluster(),
             joinTraits,
             leftUnwrapped,
             rightUnwrapped,
-            join.getCondition(),
+            normalizedCondition,
             join.getJoinType(),
             viableBackends
         );

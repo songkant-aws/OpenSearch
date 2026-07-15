@@ -102,6 +102,20 @@ public class JoinStrategyCBOSelectionTests extends BasePlannerRulesTests {
         );
     }
 
+    public void testCommonEquiFactorAcrossOrBranchesEnablesHashShuffle() {
+        PlannerContext context = buildMppContext(
+            Map.of("big_left", 3, "big_right", 3),
+            Map.of("big_left", LARGE, "big_right", LARGE),
+            /* mppEnabled */ true
+        );
+        RelNode result = runPlanner(makeOrBranchedEquiJoin("big_left", "big_right"), context);
+
+        assertContainsShuffleExchange("a q19-style repeated equi key must not be misclassified as a theta join", result);
+        OpenSearchJoin workerJoin = findWorkerJoin(result);
+        assertNotNull(workerJoin);
+        assertFalse("common p_partkey=l_partkey must be extracted as an equi key", workerJoin.analyzeCondition().leftKeys.isEmpty());
+    }
+
     public void testRowBudgetForcesSortMergeJoin() {
         Settings settings = Settings.builder()
             .put("analytics.mpp.worker.sort_merge_join_min_rows", 1_000_000L)
@@ -495,6 +509,40 @@ public class JoinStrategyCBOSelectionTests extends BasePlannerRulesTests {
             rexBuilder.makeInputRef(intType, leftCols + 1)
         );
         RexNode condition = rexBuilder.makeCall(SqlStdOperatorTable.AND, equi, residual);
+        return LogicalJoin.create(leftScan, rightScan, List.of(), condition, Set.of(), JoinRelType.INNER);
+    }
+
+    /** TPC-H q19 shape: {@code (key = key AND branch1) OR (key = key AND branch2)}.
+     *  The repeated equality must be pulled above the OR before join-key analysis. */
+    private RelNode makeOrBranchedEquiJoin(String leftIdx, String rightIdx) {
+        RelNode leftScan = stubScan(mockTable(leftIdx, "status", "size"));
+        RelNode rightScan = stubScan(mockTable(rightIdx, "status", "size"));
+        int leftCols = leftScan.getRowType().getFieldCount();
+        RelDataType intType = typeFactory.createSqlType(SqlTypeName.INTEGER);
+        RexNode equi = rexBuilder.makeCall(
+            SqlStdOperatorTable.EQUALS,
+            rexBuilder.makeInputRef(intType, 0),
+            rexBuilder.makeInputRef(intType, leftCols)
+        );
+        RexNode firstBranch = rexBuilder.makeCall(
+            SqlStdOperatorTable.AND,
+            equi,
+            rexBuilder.makeCall(
+                SqlStdOperatorTable.LESS_THAN,
+                rexBuilder.makeInputRef(intType, 1),
+                rexBuilder.makeInputRef(intType, leftCols + 1)
+            )
+        );
+        RexNode secondBranch = rexBuilder.makeCall(
+            SqlStdOperatorTable.AND,
+            equi,
+            rexBuilder.makeCall(
+                SqlStdOperatorTable.GREATER_THAN,
+                rexBuilder.makeInputRef(intType, 1),
+                rexBuilder.makeInputRef(intType, leftCols + 1)
+            )
+        );
+        RexNode condition = rexBuilder.makeCall(SqlStdOperatorTable.OR, firstBranch, secondBranch);
         return LogicalJoin.create(leftScan, rightScan, List.of(), condition, Set.of(), JoinRelType.INNER);
     }
 

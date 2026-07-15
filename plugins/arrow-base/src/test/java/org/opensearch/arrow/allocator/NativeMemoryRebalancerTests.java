@@ -10,6 +10,7 @@ package org.opensearch.arrow.allocator;
 
 import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
+import org.opensearch.arrow.spi.NativeAllocator;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.ArrayList;
@@ -107,6 +108,58 @@ public class NativeMemoryRebalancerTests extends OpenSearchTestCase {
 
         assertEquals(limitA, allocator.getPoolAllocator("a").getLimit());
         assertEquals(limitB, allocator.getPoolAllocator("b").getLimit());
+    }
+
+    public void testRestoresShrunkVirtualPoolAfterPressureSubsides() {
+        List<Long> dataFusionLimits = new ArrayList<>();
+        NativeAllocator.VirtualPoolHandle dataFusion = allocator.registerVirtualPool(
+            "datafusion",
+            5 * MB,
+            50 * MB,
+            null,
+            dataFusionLimits::add
+        );
+        allocator.getOrCreatePool("query", 5 * MB, 50 * MB, null);
+
+        BufferAllocator queryPool = allocator.getPoolAllocator("query");
+        ArrowBuf queryBuffer = queryPool.buffer((long) (50 * MB * 0.8));
+        rebalancer.rebalance();
+        long shrunkLimit = dataFusion.limit();
+        assertTrue("DataFusion should lend idle capacity", shrunkLimit < 50 * MB);
+
+        queryBuffer.close();
+        dataFusion.updateStats(0, 0);
+        rebalancer.rebalance();
+
+        assertEquals("DataFusion max should recover after query pressure drains", 50 * MB, dataFusion.limit());
+        assertEquals("Query borrowed capacity should return to max", 50 * MB, queryPool.getLimit());
+        assertEquals(
+            "Virtual-pool callback should see the restored limit",
+            Long.valueOf(50 * MB),
+            dataFusionLimits.get(dataFusionLimits.size() - 1)
+        );
+    }
+
+    public void testRestorationDoesNotDropBorrowerBelowLiveAllocation() {
+        allocator.getOrCreatePool("borrower", 5 * MB, 50 * MB, null);
+        allocator.getOrCreatePool("lender", 5 * MB, 50 * MB, null);
+        allocator.setPoolEffectiveLimit("borrower", 80 * MB);
+        allocator.setPoolEffectiveLimit("lender", 20 * MB);
+
+        BufferAllocator borrower = allocator.getPoolAllocator("borrower");
+        ArrowBuf borrowedBuffer = borrower.buffer(60 * MB);
+        try {
+            rebalancer.rebalance();
+
+            assertEquals("Borrower must retain its live 60MB allocation", 60 * MB, borrower.getLimit());
+            assertEquals("Only safely reclaimed capacity may restore the lender", 40 * MB, allocator.getPoolAllocator("lender").getLimit());
+        } finally {
+            borrowedBuffer.close();
+        }
+
+        rebalancer.rebalance();
+        assertEquals(50 * MB, borrower.getLimit());
+        assertEquals(50 * MB, allocator.getPoolAllocator("lender").getLimit());
     }
 
     public void testResetAllPoolsToMax() {
