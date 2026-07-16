@@ -102,6 +102,22 @@ public class JoinStrategyCBOSelectionTests extends BasePlannerRulesTests {
         );
     }
 
+    public void testMissingBuildStatsDoNotMakeHashJoinLookMemorySafe() {
+        // The planner's metadata layer uses a nominal row count for an unanalysed table. The
+        // MPP hash-split rule must not feed that placeholder into the build-memory gate: without
+        // an actual index statistic, it must not select the in-memory HJ alternative.
+        Settings settings = Settings.builder()
+            .put("analytics.mpp.broadcast.max_bytes", "1b")
+            .put("analytics.mpp.worker.sort_merge_join_min_rows", 1L)
+            .build();
+        PlannerContext context = buildMppContext(Map.of("big_left", 3, "big_right", 3), Map.of("big_left", LARGE), true, settings);
+        RelNode result = runPlanner(makeJoin(context, "big_left", "big_right", JoinRelType.INNER, true), context);
+
+        // With no trustworthy build size, CBO may conservatively keep the join coordinator-centric;
+        // the invariant is that it must never select the memory-gated HJ alternative.
+        assertNotEquals(OpenSearchJoin.JoinAlgorithm.HASH, findWorkerJoinAlgorithm(result));
+    }
+
     public void testCommonEquiFactorAcrossOrBranchesEnablesHashShuffle() {
         PlannerContext context = buildMppContext(
             Map.of("big_left", 3, "big_right", 3),

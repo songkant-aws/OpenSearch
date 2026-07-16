@@ -19,7 +19,6 @@ import org.opensearch.analytics.spi.ShuffleBufferRegistry;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
-import java.io.EOFException;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.UncheckedIOException;
@@ -38,6 +37,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.zip.CRC32C;
 
 /**
  * Per-node registry of shuffle buffers for hash-shuffle joins. One {@link ShuffleBuffer} per
@@ -109,8 +109,9 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
      * target side to a per-(query,stage,partition,side) spill file under {@link #spillDir} instead of
      * throwing — so the on-heap footprint stays bounded by the budget while the rest lives on disk.
      * The consumer drains the sealed spilled prefix back in arrival order, then continues from a
-     * bounded live queue. Spill stops once live draining begins so a later spill cannot overtake an
-     * already queued chunk. {@link #spillMaxBytes} is the hard disk ceiling across all of this node's
+     * bounded live queue. Spill stops for a side once that side's live draining begins, so a later
+     * spill cannot overtake an already queued chunk; the other side may still spill while it is not
+     * draining. {@link #spillMaxBytes} is the hard disk ceiling across all of this node's
      * spill files; hitting it (or a disk write I/O error) is the new terminal failure
      * (re-messaged {@link ShuffleBufferExceededException}). All counter mutations on the spill path
      * stay under {@link #admitLock} (same accounting path as {@code releaseLocked}); the byte budget
@@ -135,13 +136,13 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
 
     /**
      * Per-chunk on-disk framing overhead: each spilled chunk is written as a big-endian 4-byte length
-     * prefix followed by its payload (see {@code SpilledSide.append}). The disk-budget accounting
+     * and 4-byte CRC32C followed by its payload (see {@code SpilledSide.append}). The disk-budget accounting
      * ({@link #reserveSpillBytes}, {@code SpilledSide.bytesOnDisk}, release) must include this header,
-     * else many small chunks let real disk usage exceed {@link #spillMaxBytes} by {@code 4 × chunkCount}
+     * else many small chunks let real disk usage exceed {@link #spillMaxBytes} by {@code 8 × chunkCount}
      * while the counter stays under the ceiling. The on-HEAP eviction target tracks only payload bytes
-     * (the prefix is never heap-resident), so {@code spillOldest}'s returned {@code evicted} stays raw.
+     * (the frame is never heap-resident), so {@code spillOldest}'s returned {@code evicted} stays raw.
      */
-    private static final int SPILL_FRAME_HEADER_BYTES = Integer.BYTES;
+    private static final int SPILL_FRAME_HEADER_BYTES = Integer.BYTES * 2;
     // Admission (check-then-reserve) is serialized so concurrent producers can't both pass the
     // budget check and over-commit. Scope is the counter check+increment ONLY; storage and drain
     // stay outside the lock. Chunk arrival rate is modest (transport RPCs), so this is not hot.
@@ -936,7 +937,7 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
         }
 
         /**
-         * Appends the oldest in-memory chunks of {@code side} (length-prefixed) to that side's spill
+         * Appends the oldest in-memory chunks of {@code side} (length-and-checksum framed) to that side's spill
          * file and removes them from the in-memory list until at least {@code targetBytes} have been
          * evicted; returns the bytes actually evicted (may be less than {@code targetBytes} if the
          * side runs out of resident chunks). Oldest-first (front of the list) so reading the spill
@@ -967,8 +968,8 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
                     }
                     chunk = list.get(0);
                     int len = chunk == null ? 0 : chunk.length;
-                    // Disk footprint includes the 4-byte frame header append() writes, so the on-disk
-                    // total can't silently grow past the ceiling by 4×chunkCount. (codex round-2.)
+                    // Disk footprint includes the 8-byte frame header append() writes, so the on-disk
+                    // total can't silently grow past the ceiling by 8×chunkCount.
                     long diskBytes = len + SPILL_FRAME_HEADER_BYTES;
                     // Reserve disk budget BEFORE removing from memory — if the ceiling is hit we
                     // leave the chunk resident and fail (it's still safely in memory/accounted).
@@ -1314,7 +1315,7 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
                     public void close() {}
                 };
             }
-            // Spilled: stream the file chunk-by-chunk, then the in-memory tail. The DataInputStream is
+            // Spilled: stream the file chunk-by-chunk, then the in-memory tail. The frame reader is
             // owned by the iterator and closed on close() / at clean EOF.
             return new SpillThenTailIterator(spill, tail);
         }
@@ -1466,9 +1467,53 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
             }
         }
 
+        /** Reads one length-and-checksum framed chunk, or {@code null} at clean EOF. */
+        private static final class SpillFrameReader implements AutoCloseable {
+            private final DataInputStream in;
+            private final Path path;
+            private long remaining;
+
+            SpillFrameReader(Path path) throws IOException {
+                this.path = path;
+                this.remaining = Files.size(path);
+                this.in = new DataInputStream(new BufferedInputStream(Files.newInputStream(path)));
+            }
+
+            byte[] next() throws IOException {
+                if (remaining == 0) {
+                    return null;
+                }
+                if (remaining < SPILL_FRAME_HEADER_BYTES) {
+                    throw new IOException("Truncated shuffle spill frame header in " + path);
+                }
+                int len = in.readInt();
+                int expectedChecksum = in.readInt();
+                remaining -= SPILL_FRAME_HEADER_BYTES;
+                // Check the file size before allocating. A corrupt length must never be allowed to
+                // turn into an unbounded byte[] allocation.
+                if (len < 0 || (long) len > remaining) {
+                    throw new IOException("Invalid shuffle spill frame length " + len + " in " + path);
+                }
+                byte[] chunk = new byte[len];
+                in.readFully(chunk);
+                remaining -= len;
+                CRC32C checksum = new CRC32C();
+                checksum.update(chunk, 0, len);
+                if ((int) checksum.getValue() != expectedChecksum) {
+                    throw new IOException("Shuffle spill frame checksum mismatch in " + path);
+                }
+                return chunk;
+            }
+
+            @Override
+            public void close() throws IOException {
+                in.close();
+            }
+        }
+
         /** Streams the already-spilled prefix, then switches to the live resident queue. */
         private static final class SpillThenLiveIterator implements CloseableIterator<byte[]> {
-            private DataInputStream in;
+            private SpillFrameReader in;
             private final LiveSideIterator live;
             private final Path spillPath;
             private byte[] nextChunk;
@@ -1516,15 +1561,7 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
 
             private byte[] readNextChunk() {
                 try {
-                    int len;
-                    try {
-                        len = in.readInt();
-                    } catch (EOFException eof) {
-                        return null;
-                    }
-                    byte[] chunk = new byte[len];
-                    in.readFully(chunk);
-                    return chunk;
+                    return in.next();
                 } catch (IOException e) {
                     throw new UncheckedIOException("Failed to read back shuffle spill file " + spillPath, e);
                 }
@@ -1550,7 +1587,7 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
 
         /**
          * Lazy drain iterator: yields spilled chunks streamed one-at-a-time from {@code spill}'s file
-         * (deframing the big-endian length prefix), then the heap-resident {@code tail}. Only ONE
+         * (deframing the big-endian length-and-checksum frame), then the heap-resident {@code tail}. Only ONE
          * chunk is in heap at a time during the spilled phase — that is the property that lets an
          * over-budget partition drain through the consumer's bounded native channel without OOM.
          * Closing it releases the spill-file stream; it is also closed automatically at clean EOF of
@@ -1558,7 +1595,7 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
          * (correctness over silent under-delivery — matches the eager {@code drainSide}).
          */
         private static final class SpillThenTailIterator implements CloseableIterator<byte[]> {
-            private DataInputStream in;          // null once the spilled phase is exhausted/closed
+            private SpillFrameReader in;          // null once the spilled phase is exhausted/closed
             private final Iterator<byte[]> tail;
             private final Path spillPath;
             private byte[] nextChunk;            // one-chunk lookahead from the file
@@ -1612,18 +1649,10 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
                 return tail.next();
             }
 
-            /** Reads one length-prefixed chunk, or {@code null} at clean EOF. */
+            /** Reads one length-and-checksum framed chunk, or {@code null} at clean EOF. */
             private byte[] readNextChunk() {
                 try {
-                    int len;
-                    try {
-                        len = in.readInt();
-                    } catch (EOFException eof) {
-                        return null; // clean end of file
-                    }
-                    byte[] chunk = new byte[len];
-                    in.readFully(chunk);
-                    return chunk;
+                    return in.next();
                 } catch (IOException e) {
                     throw new UncheckedIOException("Failed to read back shuffle spill file " + spillPath, e);
                 }
@@ -1643,10 +1672,10 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
         }
 
         /**
-         * One side's on-disk spill file: a sequence of length-prefixed Arrow-IPC chunks
-         * ({@code int length} big-endian, then {@code length} bytes), appended in arrival order.
-         * Each chunk is already a self-describing Arrow IPC stream, so the frame just needs to record
-         * its byte length to split the concatenation back apart on read.
+         * One side's on-disk spill file: a sequence of framed Arrow-IPC chunks
+         * ({@code int length} big-endian, {@code int CRC32C}, then {@code length} bytes), appended in
+         * arrival order. Each chunk is already a self-describing Arrow IPC stream; the length splits
+         * the concatenation and the checksum rejects truncated or corrupted frames.
          *
          * <p>Writes happen under the manager's {@code admitLock} (one writer at a time);
          * {@link #readBack} runs once at drain after the buffer is fully populated. The append stream
@@ -1665,20 +1694,27 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
                 this.out = new BufferedOutputStream(Files.newOutputStream(path));
             }
 
-            /** Appends one length-prefixed chunk and flushes so it is durably readable at drain. */
+            /** Appends one length-and-checksum framed chunk and flushes so it is readable at drain. */
             void append(byte[] chunk) throws IOException {
                 int len = chunk == null ? 0 : chunk.length;
-                // Big-endian 4-byte length prefix, then the chunk bytes.
+                CRC32C checksum = new CRC32C();
+                checksum.update(chunk == null ? new byte[0] : chunk, 0, len);
+                int checksumValue = (int) checksum.getValue();
+                // Big-endian 4-byte length and checksum, then the chunk bytes.
                 out.write((len >>> 24) & 0xFF);
                 out.write((len >>> 16) & 0xFF);
                 out.write((len >>> 8) & 0xFF);
                 out.write(len & 0xFF);
+                out.write((checksumValue >>> 24) & 0xFF);
+                out.write((checksumValue >>> 16) & 0xFF);
+                out.write((checksumValue >>> 8) & 0xFF);
+                out.write(checksumValue & 0xFF);
                 if (len > 0) {
                     out.write(chunk);
                 }
                 out.flush();
                 // Include the frame header so bytesOnDisk (released on cleanup) matches the framed size
-                // reserved in spillOldest — else cleanup under-releases by 4×chunkCount. (codex round-2.)
+                // reserved in spillOldest — else cleanup under-releases by 8×chunkCount.
                 bytesOnDisk += len + SPILL_FRAME_HEADER_BYTES;
             }
 
@@ -1688,17 +1724,17 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
              * written (the side spilled nothing). The caller owns the returned stream and must close
              * it. Used by the LAZY drain path so chunks are read one-at-a-time, never all-resident.
              */
-            DataInputStream openForRead() throws IOException {
+            SpillFrameReader openForRead() throws IOException {
                 closeOut();
                 if (!Files.exists(path)) {
                     return null;
                 }
-                return new DataInputStream(new BufferedInputStream(Files.newInputStream(path)));
+                return new SpillFrameReader(path);
             }
 
             /**
-             * Reads every spilled chunk back, in write (= arrival) order, deframing on the length
-             * prefix. Closes the append stream first so all buffered bytes are flushed.
+             * Reads every spilled chunk back, in write (= arrival) order, deframing and validating
+             * each frame. Closes the append stream first so all buffered bytes are flushed.
              */
             List<byte[]> readBack() throws IOException {
                 closeOut();
@@ -1706,16 +1742,12 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
                 if (!Files.exists(path)) {
                     return chunks;
                 }
-                try (DataInputStream in = new DataInputStream(new BufferedInputStream(Files.newInputStream(path)))) {
+                try (SpillFrameReader in = new SpillFrameReader(path)) {
                     while (true) {
-                        int len;
-                        try {
-                            len = in.readInt();
-                        } catch (EOFException eof) {
-                            break; // clean end of file
+                        byte[] chunk = in.next();
+                        if (chunk == null) {
+                            break;
                         }
-                        byte[] chunk = new byte[len];
-                        in.readFully(chunk);
                         chunks.add(chunk);
                     }
                 }

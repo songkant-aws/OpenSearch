@@ -694,6 +694,41 @@ mod tests {
         )?)
     }
 
+    fn join_for_type(join_type: JoinType) -> Result<HashJoinExec> {
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("left_value", DataType::Int64, false),
+        ]));
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("right_value", DataType::Int64, false),
+        ]));
+        let left = input(
+            Arc::clone(&left_schema),
+            (0..100).collect(),
+            (0..100).map(i64::from).collect(),
+        )?;
+        let right = input(
+            Arc::clone(&right_schema),
+            (50..150).collect(),
+            (50..150).map(|value| i64::from(value) * 10).collect(),
+        )?;
+        HashJoinExec::try_new(
+            left,
+            right,
+            vec![(
+                Arc::new(Column::new("key", 0)),
+                Arc::new(Column::new("key", 0)),
+            )],
+            None,
+            &join_type,
+            None,
+            PartitionMode::Partitioned,
+            NullEquality::NullEqualsNothing,
+            false,
+        )
+    }
+
     #[tokio::test]
     async fn spills_partitioned_hash_join_and_preserves_results() -> Result<()> {
         let left_schema = Arc::new(Schema::new(vec![
@@ -783,6 +818,38 @@ mod tests {
             1
         );
         assert!(metrics.spilled_bytes().unwrap_or_default() > 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spills_outer_semi_and_anti_join_types() -> Result<()> {
+        // Every join type must preserve HashJoinExec's null-extension and filtering semantics when
+        // the build/probe inputs are split into Grace buckets. The original test covered only INNER.
+        for (join_type, expected_rows, expected_columns) in [
+            (JoinType::Left, 100, 4),
+            (JoinType::Right, 100, 4),
+            (JoinType::Full, 150, 4),
+            (JoinType::LeftSemi, 50, 2),
+            (JoinType::LeftAnti, 50, 2),
+        ] {
+            let join = join_for_type(join_type)?;
+            let adaptive = SpillableHashJoinExec::new_with_build_target(&join, 512);
+            let batches = adaptive
+                .execute(0, Arc::new(TaskContext::default()))?
+                .try_collect::<Vec<_>>()
+                .await?;
+            assert_eq!(
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                expected_rows,
+                "unexpected row count for {join_type:?}"
+            );
+            assert!(
+                batches
+                    .iter()
+                    .all(|batch| batch.num_columns() == expected_columns),
+                "unexpected schema width for {join_type:?}"
+            );
+        }
         Ok(())
     }
 }

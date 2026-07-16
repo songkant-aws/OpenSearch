@@ -21,6 +21,7 @@ import org.opensearch.analytics.AnalyticsSettings;
 import org.opensearch.analytics.exec.join.MppShufflePartitions;
 import org.opensearch.analytics.planner.OpenSearchRelMetadataQuery;
 import org.opensearch.analytics.planner.PlannerContext;
+import org.opensearch.analytics.planner.RelNodeUtils;
 import org.opensearch.analytics.planner.rel.OpenSearchDistribution;
 import org.opensearch.analytics.planner.rel.OpenSearchDistributionTraitDef;
 import org.opensearch.analytics.planner.rel.OpenSearchFilter;
@@ -163,6 +164,13 @@ public class OpenSearchHashJoinSplitRule extends RelOptRule {
         RelMetadataQuery mq = call.getMetadataQuery();
         Double buildRowsValue = mq.getRowCount(join.getRight());
         double buildRows = buildRowsValue == null ? Double.NaN : buildRowsValue;
+        // Calcite's RelOptTable API uses a nominal 100-row fallback for unknown statistics. Do not
+        // let that fallback pass the HJ memory gate: consult the planner's actual per-index stats
+        // source and mark the build unknown when any underlying scan lacks a row count. This keeps
+        // coordinator-only plan-shape behavior unchanged while making MPP HJ conservative.
+        if (hasUnknownTableStatistics(join.getRight())) {
+            buildRows = Double.NaN;
+        }
         Double averageRowSize = mq.getAverageRowSize(join.getRight());
         double rowWidth = averageRowSize == null || !Double.isFinite(averageRowSize) || averageRowSize <= 0d
             ? OpenSearchRelMetadataQuery.estimateRowWidthBytes(join.getRight().getRowType())
@@ -204,6 +212,16 @@ public class OpenSearchHashJoinSplitRule extends RelOptRule {
                 maxBytesPerWorker
             )
         );
+    }
+
+    private boolean hasUnknownTableStatistics(RelNode rel) {
+        for (OpenSearchTableScan scan : RelNodeUtils.findNodes(rel, OpenSearchTableScan.class)) {
+            String tableName = scan.getTable().getQualifiedName().getLast();
+            if (context.getTableRowCounts().applyAsLong(tableName) == PlannerContext.UNKNOWN_ROW_COUNT) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void emitAlgorithmAlternative(RelOptRuleCall call, OpenSearchJoin originalJoin, OpenSearchJoin workerJoin) {

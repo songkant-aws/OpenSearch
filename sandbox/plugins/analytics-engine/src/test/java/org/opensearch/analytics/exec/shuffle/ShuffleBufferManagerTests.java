@@ -12,6 +12,7 @@ import org.opensearch.analytics.exec.shuffle.ShuffleBufferManager.AdmitResult;
 import org.opensearch.analytics.spi.ShuffleBufferExceededException;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -20,6 +21,8 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 public class ShuffleBufferManagerTests extends OpenSearchTestCase {
+
+    private static final int SPILL_FRAME_HEADER_BYTES = Integer.BYTES * 2;
 
     public void testPartitionStatsTrackReceivedAndSpilledChunks() throws Exception {
         Path spillDir = createTempDir();
@@ -366,6 +369,12 @@ public class ShuffleBufferManagerTests extends OpenSearchTestCase {
         }
     }
 
+    private static Path firstSpillFile(Path dir) throws Exception {
+        try (var s = Files.list(dir)) {
+            return s.filter(p -> p.getFileName().toString().endsWith(".spill")).findFirst().orElseThrow();
+        }
+    }
+
     /**
      * Spill enabled: feeding chunks that exceed the per-query budget does NOT throw — the oldest
      * resident chunks spill to disk. The consumer's getLeftData() returns ALL chunks in ARRIVAL order
@@ -468,23 +477,70 @@ public class ShuffleBufferManagerTests extends OpenSearchTestCase {
         Path spillDir = createTempDir();
         ShuffleBufferManager mgr = new ShuffleBufferManager();
         mgr.setBudgets(10_000, 100);
-        // Disk ceiling of 60 bytes. Each spilled 50-byte chunk costs 54 bytes on disk (50 payload + a
-        // 4-byte frame header), so the first spill (54 <= 60) fits and the second (108 > 60) breaches.
+        // Disk ceiling of 60 bytes. Each spilled 50-byte chunk costs 58 bytes on disk (50 payload + an
+        // 8-byte length/checksum frame), so the first spill (58 <= 60) fits and the second (116 > 60) breaches.
         mgr.setSpillConfig(true, spillDir, /* maxBytes */ 60);
         // Fill the budget: 100 bytes resident (chunks 0,1 of 50 each). Under budget so far.
         mgr.tryAdmit("q1", 0, 0, "left", chunk(0, 50));
         mgr.tryAdmit("q1", 0, 0, "left", chunk(1, 50));
         assertEquals(100L, mgr.getTotalBytes());
-        // Next chunk forces eviction of one chunk to disk → spilled total 54 (fits the 60 ceiling).
-        mgr.tryAdmit("q1", 0, 0, "left", chunk(2, 50)); // spills chunk 0 (54 <= 60 ceiling)
+        // Next chunk forces eviction of one chunk to disk → spilled total 58 (fits the 60 ceiling).
+        mgr.tryAdmit("q1", 0, 0, "left", chunk(2, 50)); // spills chunk 0 (58 <= 60 ceiling)
         ShuffleBufferExceededException ex = expectThrows(
             ShuffleBufferExceededException.class,
-            () -> mgr.tryAdmit("q1", 0, 0, "left", chunk(3, 50)) // would spill a 2nd chunk → 108 > 60
+            () -> mgr.tryAdmit("q1", 0, 0, "left", chunk(3, 50)) // would spill a 2nd chunk → 116 > 60
         );
         assertEquals("disk-ceiling exception names the spill.max_bytes limit", 60L, ex.limitBytes());
         // Terminal cleanup (as the coordinator does on failure) closes + deletes the open spill file.
         mgr.clearForQuery("q1");
         assertEquals("no .spill file may survive the terminal", 0L, countSpillFiles(spillDir.resolve("q1")));
+    }
+
+    /** A corrupt length prefix must fail before allocating a byte array sized by the corrupt value. */
+    public void testSpillRejectsCorruptFrameLengthBeforeAllocation() throws Exception {
+        Path spillDir = createTempDir();
+        ShuffleBufferManager mgr = new ShuffleBufferManager();
+        mgr.setBudgets(10_000, 100);
+        mgr.setSpillConfig(true, spillDir, 1_000_000);
+        try {
+            mgr.tryAdmit("q1", 0, 0, "left", chunk(0, 50));
+            mgr.tryAdmit("q1", 0, 0, "left", chunk(1, 50));
+            mgr.tryAdmit("q1", 0, 0, "left", chunk(2, 50));
+            Path spillFile = firstSpillFile(spillDir.resolve("q1"));
+            byte[] frame = Files.readAllBytes(spillFile);
+            frame[0] = 0x7F;
+            frame[1] = (byte) 0xFF;
+            frame[2] = (byte) 0xFF;
+            frame[3] = (byte) 0xFF;
+            Files.write(spillFile, frame);
+
+            UncheckedIOException ex = expectThrows(UncheckedIOException.class, () -> mgr.getBuffer("q1", 0, 0).getLeftData());
+            assertTrue(ex.getCause().getMessage().contains("Invalid shuffle spill frame length"));
+        } finally {
+            mgr.clearForQuery("q1");
+        }
+    }
+
+    /** A payload corruption must be detected by the per-frame CRC32C check. */
+    public void testSpillRejectsCorruptFrameChecksum() throws Exception {
+        Path spillDir = createTempDir();
+        ShuffleBufferManager mgr = new ShuffleBufferManager();
+        mgr.setBudgets(10_000, 100);
+        mgr.setSpillConfig(true, spillDir, 1_000_000);
+        try {
+            mgr.tryAdmit("q1", 0, 0, "left", chunk(0, 50));
+            mgr.tryAdmit("q1", 0, 0, "left", chunk(1, 50));
+            mgr.tryAdmit("q1", 0, 0, "left", chunk(2, 50));
+            Path spillFile = firstSpillFile(spillDir.resolve("q1"));
+            byte[] frame = Files.readAllBytes(spillFile);
+            frame[SPILL_FRAME_HEADER_BYTES + 1] ^= 0x01;
+            Files.write(spillFile, frame);
+
+            UncheckedIOException ex = expectThrows(UncheckedIOException.class, () -> mgr.getBuffer("q1", 0, 0).getLeftData());
+            assertTrue(ex.getCause().getMessage().contains("checksum mismatch"));
+        } finally {
+            mgr.clearForQuery("q1");
+        }
     }
 
     /**
