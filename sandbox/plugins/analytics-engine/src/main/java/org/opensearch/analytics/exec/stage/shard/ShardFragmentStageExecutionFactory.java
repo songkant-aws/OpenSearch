@@ -26,7 +26,7 @@ import org.opensearch.cluster.service.ClusterService;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.function.Function;
+import java.util.function.BiFunction;
 
 /**
  * Builds a {@link ShardFragmentStageExecution} that fans out shard requests via
@@ -56,13 +56,9 @@ public final class ShardFragmentStageExecutionFactory implements StageExecutionF
         List<FragmentExecutionRequest.PlanAlternative> planAlternatives = buildPlanAlternatives(stage);
         final String queryId = config.queryId();
         final int stageId = stage.getStageId();
-        Function<ShardExecutionTarget, FragmentExecutionRequest> requestBuilder = target -> new FragmentExecutionRequest(
-            queryId,
-            stageId,
-            target.shardId(),
-            planAlternatives,
-            config.profile()
-        );
+        BiFunction<ShardStageTask, ShardExecutionTarget, FragmentExecutionRequest> requestBuilder = (
+            task,
+            target) -> new FragmentExecutionRequest(queryId, stageId, target.shardId(), planAlternatives, config.profile(), task.attempt());
         // Execution pulls the resolver off `stage` and calls resolve() lazily at start().
         // This keeps target resolution out of the build phase so cancellation before
         // dispatch doesn't pay for cluster-state routing, and leaves room for shuffle

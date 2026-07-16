@@ -25,7 +25,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use datafusion::arrow::array::UInt32Array;
-use datafusion::arrow::compute::take;
+use datafusion::arrow::compute::{take, SortOptions};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::config::ConfigOptions;
@@ -35,13 +35,17 @@ use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::execution::disk_manager::RefCountedTempFile;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryLimit};
 use datafusion::execution::TaskContext;
+use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_expr_common::utils::evaluate_expressions_to_arrays;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SeededRandomState};
+use datafusion::physical_plan::joins::{
+    HashJoinExec, PartitionMode, SeededRandomState, SortMergeJoinExec,
+};
 use datafusion::physical_plan::limit::LimitStream;
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, SpillMetrics, Time,
 };
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
 use datafusion::physical_plan::{
@@ -60,6 +64,11 @@ const DEFAULT_BUILD_TARGET_BYTES: usize = 512 * 1024 * 1024;
 /// too large because of extreme key skew is still protected by DataFusion's
 /// memory reservation and fails with a resource error rather than an OOM.
 const MAX_SPILL_BUCKETS: usize = 256;
+/// Number of child buckets used when a single Grace bucket is still too large.
+/// Recursive repartitioning is deliberately bounded; the final level falls back
+/// to DataFusion's spillable sort-merge join instead of risking an allocator OOM.
+const RECURSIVE_BUCKET_FANOUT: usize = 4;
+const MAX_RECURSIVE_DEPTH: usize = 4;
 /// Seed used only for the local Grace repartition. The upstream MPP exchange uses
 /// DataFusion's `REPARTITION_RANDOM_STATE` (seed 0); reusing it here can collapse all
 /// rows into one bucket when the exchange partition count is a power of two.
@@ -281,7 +290,7 @@ impl SpillableHashJoinExec {
         let build_files = partition_spill_file(
             raw_build,
             &build_spill_manager,
-            left_keys,
+            left_keys.clone(),
             bucket_count,
             partition,
             &metrics,
@@ -294,7 +303,7 @@ impl SpillableHashJoinExec {
         let probe_files = partition_stream_to_files(
             probe_stream,
             &probe_spill_manager,
-            right_keys,
+            right_keys.clone(),
             bucket_count,
             partition,
             &metrics,
@@ -303,26 +312,31 @@ impl SpillableHashJoinExec {
         )
         .await?;
 
-        let mut bucket_streams = Vec::with_capacity(bucket_count);
-        for (build_file, probe_file) in build_files.into_iter().zip(probe_files) {
-            let build = spill_file_exec(
-                original.left().schema(),
-                build_spill_manager.clone(),
-                build_file,
-            )?;
-            let probe = spill_file_exec(
-                original.right().schema(),
-                probe_spill_manager.clone(),
-                probe_file,
-            )?;
-            let join = rebuild_bucket_join(&original, build, probe)?;
-            bucket_streams.push(join.execute(0, Arc::clone(&context))?);
-        }
+        let bucket_plans = expand_oversized_buckets(
+            build_files,
+            probe_files,
+            target_bytes,
+            &build_spill_manager,
+            &probe_spill_manager,
+            left_keys,
+            right_keys,
+            partition,
+            &metrics,
+        )
+        .await?;
 
-        let chained: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+        // Execute one bucket at a time. The previous implementation created a
+        // stream for every bucket eagerly, which kept all file readers and all
+        // per-bucket join state alive until the final output batch. This lazy
+        // stream releases each bucket before opening the next one.
+        let chained = lazy_bucket_stream(
             original.schema(),
-            stream::iter(bucket_streams).flatten(),
-        ));
+            Arc::clone(&original),
+            bucket_plans,
+            build_spill_manager,
+            probe_spill_manager,
+            Arc::clone(&context),
+        );
         if let Some(fetch) = original.fetch() {
             let baseline = BaselineMetrics::new(&metrics, partition);
             Ok(Box::pin(LimitStream::new(
@@ -426,6 +440,218 @@ fn rebuild_bucket_join(
         .with_fetch(None)
         .reset_state()
         .build_exec()
+}
+
+fn rebuild_sort_merge_join(
+    original: &HashJoinExec,
+    build: Arc<dyn ExecutionPlan>,
+    probe: Arc<dyn ExecutionPlan>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let join_on = original.on().to_vec();
+    // SortMergeJoinExec requires sorted children. Grace files are bucketed, not ordered, so use
+    // DataFusion's external SortExec (which can spill independently) before the final hot-bucket
+    // merge. Keeping this in the runtime fallback is what makes the fallback correct for arbitrary
+    // key distributions, rather than only the single-key test case.
+    let left_ordering = LexOrdering::new(
+        original
+            .on()
+            .iter()
+            .map(|(left, _)| PhysicalSortExpr {
+                expr: Arc::clone(left),
+                options: SortOptions::default(),
+            })
+            .collect::<Vec<_>>(),
+    )
+    .ok_or_else(|| DataFusionError::Internal("SMJ fallback has no join keys".to_string()))?;
+    let right_ordering = LexOrdering::new(
+        original
+            .on()
+            .iter()
+            .map(|(_, right)| PhysicalSortExpr {
+                expr: Arc::clone(right),
+                options: SortOptions::default(),
+            })
+            .collect::<Vec<_>>(),
+    )
+    .ok_or_else(|| DataFusionError::Internal("SMJ fallback has no join keys".to_string()))?;
+    let join = SortMergeJoinExec::try_new(
+        Arc::new(SortExec::new(left_ordering, build)),
+        Arc::new(SortExec::new(right_ordering, probe)),
+        join_on,
+        original.filter().cloned(),
+        *original.join_type(),
+        vec![SortOptions::default(); original.on().len()],
+        original.null_equality(),
+    )?;
+    Ok(Arc::new(join))
+}
+
+#[derive(Debug)]
+struct BucketPlan {
+    build: Option<RefCountedTempFile>,
+    probe: Option<RefCountedTempFile>,
+    /// A final hot bucket uses SMJ, whose own sort streams are spillable.
+    sort_merge: bool,
+}
+
+fn grace_seed(depth: usize) -> SeededRandomState {
+    let salt = 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(depth as u64 + 1);
+    SeededRandomState::with_seed(GRACE_HASH_SEED.seed().wrapping_add(salt))
+}
+
+async fn expand_oversized_buckets(
+    build_files: Vec<Option<RefCountedTempFile>>,
+    probe_files: Vec<Option<RefCountedTempFile>>,
+    target_bytes: usize,
+    build_manager: &SpillManager,
+    probe_manager: &SpillManager,
+    build_keys: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>>,
+    probe_keys: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>>,
+    input_partition: usize,
+    metrics: &ExecutionPlanMetricsSet,
+) -> Result<Vec<BucketPlan>> {
+    let recursive_spill_count =
+        MetricBuilder::new(metrics).counter("recursive_spill_count", input_partition);
+    let sort_merge_fallback_count =
+        MetricBuilder::new(metrics).counter("sort_merge_fallback_count", input_partition);
+    let mut pending = build_files
+        .into_iter()
+        .zip(probe_files)
+        .map(|(build, probe)| (build, probe, 0usize))
+        .collect::<Vec<_>>();
+    let mut output = Vec::new();
+    let per_bucket_target = (target_bytes / 2).max(MIN_BUILD_TARGET_BYTES) as u64;
+
+    while let Some((build, probe, depth)) = pending.pop() {
+        let build_bytes = build
+            .as_ref()
+            .map(RefCountedTempFile::current_disk_usage)
+            .unwrap_or(0);
+        if build_bytes <= per_bucket_target || depth >= MAX_RECURSIVE_DEPTH {
+            if build_bytes > per_bucket_target {
+                sort_merge_fallback_count.add(1);
+            }
+            output.push(BucketPlan {
+                build,
+                probe,
+                sort_merge: build_bytes > per_bucket_target,
+            });
+            continue;
+        }
+        recursive_spill_count.add(1);
+
+        // Split both sides with the same depth-specific seed. A different seed
+        // per recursion level prevents a hot bucket from reproducing the exact
+        // collision pattern at every level.
+        let build_children = match build {
+            Some(file) => {
+                partition_spill_file(
+                    file,
+                    build_manager,
+                    build_keys.clone(),
+                    RECURSIVE_BUCKET_FANOUT,
+                    input_partition,
+                    metrics,
+                    "spillable hash join recursive build bucket",
+                    grace_seed(depth + 1),
+                )
+                .await?
+            }
+            None => vec![None; RECURSIVE_BUCKET_FANOUT],
+        };
+        let probe_children = match probe {
+            Some(file) => {
+                partition_spill_file(
+                    file,
+                    probe_manager,
+                    probe_keys.clone(),
+                    RECURSIVE_BUCKET_FANOUT,
+                    input_partition,
+                    metrics,
+                    "spillable hash join recursive probe bucket",
+                    grace_seed(depth + 1),
+                )
+                .await?
+            }
+            None => vec![None; RECURSIVE_BUCKET_FANOUT],
+        };
+
+        for (child_build, child_probe) in build_children.into_iter().zip(probe_children).rev() {
+            pending.push((child_build, child_probe, depth + 1));
+        }
+    }
+
+    output.reverse();
+    Ok(output)
+}
+
+fn lazy_bucket_stream(
+    schema: SchemaRef,
+    original: Arc<HashJoinExec>,
+    buckets: Vec<BucketPlan>,
+    build_manager: SpillManager,
+    probe_manager: SpillManager,
+    context: Arc<TaskContext>,
+) -> SendableRecordBatchStream {
+    struct State {
+        original: Arc<HashJoinExec>,
+        buckets: Vec<BucketPlan>,
+        next: usize,
+        current: Option<SendableRecordBatchStream>,
+        build_manager: SpillManager,
+        probe_manager: SpillManager,
+        context: Arc<TaskContext>,
+    }
+
+    let state = State {
+        original,
+        buckets,
+        next: 0,
+        current: None,
+        build_manager,
+        probe_manager,
+        context,
+    };
+    let stream = stream::try_unfold(state, |mut state| async move {
+        loop {
+            if let Some(mut current) = state.current.take() {
+                match current.next().await {
+                    Some(Ok(batch)) => {
+                        state.current = Some(current);
+                        return Ok(Some((batch, state)));
+                    }
+                    Some(Err(error)) => return Err(error),
+                    None => {}
+                }
+            }
+
+            let Some(bucket) = state.buckets.get(state.next) else {
+                return Ok(None);
+            };
+            state.next += 1;
+            if bucket.build.is_none() && bucket.probe.is_none() {
+                continue;
+            }
+
+            let build = spill_file_exec(
+                state.original.left().schema(),
+                state.build_manager.clone(),
+                bucket.build.clone(),
+            )?;
+            let probe = spill_file_exec(
+                state.original.right().schema(),
+                state.probe_manager.clone(),
+                bucket.probe.clone(),
+            )?;
+            let join = if bucket.sort_merge {
+                rebuild_sort_merge_join(&state.original, build, probe)?
+            } else {
+                rebuild_bucket_join(&state.original, build, probe)?
+            };
+            state.current = Some(join.execute(0, Arc::clone(&state.context))?);
+        }
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, stream))
 }
 
 fn one_shot_exec(
@@ -654,7 +880,7 @@ fn apply_fetch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{Int32Array, Int64Array};
+    use datafusion::arrow::array::{Int32Array, Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::common::NullEquality;
@@ -850,6 +1076,70 @@ mod tests {
                 "unexpected schema width for {join_type:?}"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recursively_repartitions_hot_bucket_and_falls_back_to_sort_merge() -> Result<()> {
+        // A single hot key remains in one bucket under every hash seed. The wide build payload
+        // makes that bucket exceed the 1 MiB recursive target, exercising the bounded-depth SMJ
+        // escape hatch instead of attempting one unbounded hash table.
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let wide = "x".repeat(2048);
+        let left_batch = RecordBatch::try_new(
+            Arc::clone(&left_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1; 2_000])),
+                Arc::new(StringArray::from(vec![wide; 2_000])),
+            ],
+        )?;
+        let right_batch = RecordBatch::try_new(
+            Arc::clone(&right_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["probe"])),
+            ],
+        )?;
+        let left = MemorySourceConfig::try_new_exec(&[vec![left_batch]], left_schema, None)?;
+        let right = MemorySourceConfig::try_new_exec(&[vec![right_batch]], right_schema, None)?;
+        let join = HashJoinExec::try_new(
+            left,
+            right,
+            vec![(
+                Arc::new(Column::new("key", 0)),
+                Arc::new(Column::new("key", 0)),
+            )],
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::Partitioned,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?;
+        let adaptive = SpillableHashJoinExec::new_with_build_target(&join, 1);
+        let batches = adaptive
+            .execute(0, Arc::new(TaskContext::default()))?
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            2_000
+        );
+        let metrics = adaptive.metrics().expect("adaptive join metrics");
+        assert!(
+            metrics
+                .sum_by_name("sort_merge_fallback_count")
+                .expect("fallback metric")
+                .as_usize()
+                > 0
+        );
         Ok(())
     }
 }

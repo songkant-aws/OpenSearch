@@ -48,6 +48,7 @@ public final class ShuffleSenderImpl implements ShuffleSender {
     private final String queryId;
     private final int targetStageId;
     private final String side;
+    private final int producerAttempt;
 
     public ShuffleSenderImpl(
         Client client,
@@ -57,16 +58,81 @@ public final class ShuffleSenderImpl implements ShuffleSender {
         int targetStageId,
         String side
     ) {
+        this(client, threadPool, clusterService, queryId, targetStageId, side, 0);
+    }
+
+    public ShuffleSenderImpl(
+        Client client,
+        ThreadPool threadPool,
+        ClusterService clusterService,
+        String queryId,
+        int targetStageId,
+        String side,
+        int producerAttempt
+    ) {
         this.client = client;
         this.threadPool = threadPool;
         this.clusterService = clusterService;
         this.queryId = queryId;
         this.targetStageId = targetStageId;
         this.side = side;
+        this.producerAttempt = producerAttempt;
     }
 
     @Override
     public void send(String targetWorkerNodeId, int partitionIndex, byte[] data, boolean isLast, ActionListener<Void> listener) {
+        send(targetWorkerNodeId, partitionIndex, data, -1L, isLast, listener);
+    }
+
+    @Override
+    public void send(
+        String targetWorkerNodeId,
+        int partitionIndex,
+        byte[] data,
+        long sequenceNumber,
+        boolean isLast,
+        ActionListener<Void> listener
+    ) {
+        send(targetWorkerNodeId, partitionIndex, data, sequenceNumber, producerAttempt, isLast, listener);
+    }
+
+    @Override
+    public void send(
+        String targetWorkerNodeId,
+        int partitionIndex,
+        byte[] data,
+        long sequenceNumber,
+        int producerAttempt,
+        boolean isLast,
+        ActionListener<Void> listener
+    ) {
+        send(targetWorkerNodeId, partitionIndex, data, sequenceNumber, producerAttempt, 0L, isLast, listener);
+    }
+
+    @Override
+    public void send(
+        String targetWorkerNodeId,
+        int partitionIndex,
+        byte[] data,
+        long sequenceNumber,
+        long producerTaskId,
+        boolean isLast,
+        ActionListener<Void> listener
+    ) {
+        send(targetWorkerNodeId, partitionIndex, data, sequenceNumber, producerAttempt, producerTaskId, isLast, listener);
+    }
+
+    @Override
+    public void send(
+        String targetWorkerNodeId,
+        int partitionIndex,
+        byte[] data,
+        long sequenceNumber,
+        int producerAttempt,
+        long producerTaskId,
+        boolean isLast,
+        ActionListener<Void> listener
+    ) {
         DiscoveryNode targetNode = clusterService.state().nodes().get(targetWorkerNodeId);
         if (targetNode == null) {
             listener.onFailure(
@@ -92,6 +158,10 @@ public final class ShuffleSenderImpl implements ShuffleSender {
             side,
             partitionIndex,
             data == null || data.length == 0 ? null : data,
+            sequenceNumber,
+            producerAttempt,
+            producerTaskId,
+            clusterService.localNode().getId(),
             isLast,
             targetWorkerNodeId
         );

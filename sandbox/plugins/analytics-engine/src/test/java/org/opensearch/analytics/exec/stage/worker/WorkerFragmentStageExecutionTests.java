@@ -41,8 +41,28 @@ public class WorkerFragmentStageExecutionTests extends OpenSearchTestCase {
                 assertEquals("query", restored.getQueryId());
                 assertEquals(2, restored.getStageId());
                 assertEquals(1, restored.getPartitionIndex());
+                assertEquals(0, restored.getAttempt());
             }
         }
+    }
+
+    public void testWorkerRequestPreservesRetryAttemptOnWire() throws Exception {
+        WorkerFragmentRequest request = new WorkerFragmentRequest("query", 2, 1, List.of(), true, 3);
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            request.writeTo(out);
+            try (var in = out.bytes().streamInput()) {
+                assertEquals(3, new WorkerFragmentRequest(in).getAttempt());
+            }
+        }
+    }
+
+    public void testWorkerTaskCreatesNextAttemptWithSameTarget() {
+        WorkerExecutionTarget target = new WorkerExecutionTarget(mock(DiscoveryNode.class), 0);
+        WorkerStageTask first = new WorkerStageTask(new StageTaskId(2, 0), target);
+        WorkerStageTask retry = first.nextAttempt();
+        assertSame(target, retry.target());
+        assertEquals(1, retry.attempt());
+        assertEquals(first.id(), retry.id());
     }
 
     public void testTrailingMetricsAreAttachedToWorkerTask() {

@@ -22,13 +22,27 @@ import org.opensearch.analytics.planner.dag.WorkerExecutionTarget;
 public final class WorkerStageTask extends StageTask {
 
     private final WorkerExecutionTarget target;
+    private final int attempt;
 
     public WorkerStageTask(StageTaskId id, WorkerExecutionTarget target) {
+        this(id, target, 0);
+    }
+
+    public WorkerStageTask(StageTaskId id, WorkerExecutionTarget target, int attempt) {
         super(id);
         this.target = target;
+        this.attempt = attempt;
     }
 
     public WorkerExecutionTarget target() {
         return target;
+    }
+
+    public int attempt() {
+        return attempt;
+    }
+
+    public WorkerStageTask nextAttempt() {
+        return new WorkerStageTask(id(), target, attempt + 1);
     }
 }

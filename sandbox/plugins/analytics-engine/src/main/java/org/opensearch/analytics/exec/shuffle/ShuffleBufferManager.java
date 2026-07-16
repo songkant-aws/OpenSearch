@@ -26,10 +26,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -135,14 +137,23 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
     private final Map<Path, Long> orphanedSpillBytes = new ConcurrentHashMap<>();
 
     /**
-     * Per-chunk on-disk framing overhead: each spilled chunk is written as a big-endian 4-byte length
-     * and 4-byte CRC32C followed by its payload (see {@code SpilledSide.append}). The disk-budget accounting
+     * Per-chunk on-disk framing overhead: each spilled chunk is written as a big-endian 4-byte length,
+     * 4-byte CRC32C, 8-byte producer task id, 8-byte producer sequence, followed by its payload (see {@code SpilledSide.append}). The disk-budget accounting
      * ({@link #reserveSpillBytes}, {@code SpilledSide.bytesOnDisk}, release) must include this header,
-     * else many small chunks let real disk usage exceed {@link #spillMaxBytes} by {@code 8 × chunkCount}
+     * else many small chunks let real disk usage exceed {@link #spillMaxBytes} by the frame overhead.
      * while the counter stays under the ceiling. The on-HEAP eviction target tracks only payload bytes
      * (the frame is never heap-resident), so {@code spillOldest}'s returned {@code evicted} stays raw.
      */
-    private static final int SPILL_FRAME_HEADER_BYTES = Integer.BYTES * 2;
+    /** length + CRC32C + producer task id + sequence; the pair makes a spilled block self-identifying. */
+    private static final int SPILL_FRAME_HEADER_BYTES = Integer.BYTES * 2 + Long.BYTES * 2;
+
+    /** Stable block identity across retries; task id namespaces the per-producer sequence. */
+    private record ShuffleBlockId(String producerNodeId, long producerTaskId, long sequenceNumber) {
+        boolean isSequenced() {
+            return producerNodeId.isEmpty() == false && producerTaskId > 0 && sequenceNumber >= 0;
+        }
+    }
+
     // Admission (check-then-reserve) is serialized so concurrent producers can't both pass the
     // budget check and over-commit. Scope is the counter check+increment ONLY; storage and drain
     // stay outside the lock. Chunk arrival rate is modest (transport RPCs), so this is not hot.
@@ -276,6 +287,42 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
      * Buffer resolution, check-and-reserve, and storage are ALL atomic under {@link #admitLock}.
      */
     public AdmitResult tryAdmit(String queryId, int targetStageId, int partitionIndex, String side, byte[] data) {
+        return tryAdmit(queryId, targetStageId, partitionIndex, side, data, -1L);
+    }
+
+    /**
+     * Sequenced admission. A retransmission of an already accepted producer block is acknowledged
+     * without reserving or storing its bytes. This makes transport retry idempotent while retaining
+     * the legacy unsequenced API for older backends.
+     */
+    public AdmitResult tryAdmit(String queryId, int targetStageId, int partitionIndex, String side, byte[] data, long sequenceNumber) {
+        return tryAdmit(queryId, targetStageId, partitionIndex, side, data, sequenceNumber, 0L);
+    }
+
+    /** Sequenced admission with a producer task namespace. */
+    public AdmitResult tryAdmit(
+        String queryId,
+        int targetStageId,
+        int partitionIndex,
+        String side,
+        byte[] data,
+        long sequenceNumber,
+        long producerTaskId
+    ) {
+        return tryAdmit(queryId, targetStageId, partitionIndex, side, data, sequenceNumber, producerTaskId, "");
+    }
+
+    /** Sequenced admission with a globally unique producer node/task namespace. */
+    public AdmitResult tryAdmit(
+        String queryId,
+        int targetStageId,
+        int partitionIndex,
+        String side,
+        byte[] data,
+        long sequenceNumber,
+        long producerTaskId,
+        String producerNodeId
+    ) {
         int size = data == null ? 0 : data.length;
         if (size == 0) {
             return AdmitResult.ACCEPTED; // nothing to store/reserve (isLast markers carry no data)
@@ -310,6 +357,12 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
             if (buffer.isDiscarding(side)) {
                 // DataFusion ended this input early (for example LimitExec dropped the receiver).
                 // Acknowledge late producer chunks without storing/reserving them.
+                return AdmitResult.ACCEPTED;
+            }
+            // Check block identity before completion/drain guards: a late transport retry of an
+            // already accepted block must be acknowledged even after the side has reached EOF.
+            ShuffleBlockId blockId = new ShuffleBlockId(producerNodeId == null ? "" : producerNodeId, producerTaskId, sequenceNumber);
+            if (buffer.isSequenceSeen(side, blockId)) {
                 return AdmitResult.ACCEPTED;
             }
             if (buffer.isStreamFinished(side)) {
@@ -383,9 +436,52 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
             q.addAndGet(size);
             // Store under the lock so the buffer's currentBytes stays EXACTLY equal to its reserved
             // bytes — removeBuffer then releases precisely what was reserved, with no transient skew.
-            buffer.addData(side, data);
+            buffer.addData(side, data, blockId);
+            buffer.recordSequence(blockId, side);
         }
         return AdmitResult.ACCEPTED;
+    }
+
+    /** Attempt-aware overload; the block sequence remains the logical id across task retries. */
+    public AdmitResult tryAdmit(
+        String queryId,
+        int targetStageId,
+        int partitionIndex,
+        String side,
+        byte[] data,
+        long sequenceNumber,
+        int producerAttempt
+    ) {
+        return tryAdmit(queryId, targetStageId, partitionIndex, side, data, sequenceNumber, 0L);
+    }
+
+    /** Attempt-aware admission with a stable producer task namespace. */
+    public AdmitResult tryAdmit(
+        String queryId,
+        int targetStageId,
+        int partitionIndex,
+        String side,
+        byte[] data,
+        long sequenceNumber,
+        int producerAttempt,
+        long producerTaskId
+    ) {
+        return tryAdmit(queryId, targetStageId, partitionIndex, side, data, sequenceNumber, producerTaskId, "");
+    }
+
+    /** Attempt-aware admission with a stable producer node/task namespace. */
+    public AdmitResult tryAdmit(
+        String queryId,
+        int targetStageId,
+        int partitionIndex,
+        String side,
+        byte[] data,
+        long sequenceNumber,
+        int producerAttempt,
+        long producerTaskId,
+        String producerNodeId
+    ) {
+        return tryAdmit(queryId, targetStageId, partitionIndex, side, data, sequenceNumber, producerTaskId, producerNodeId);
     }
 
     /**
@@ -786,12 +882,16 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
     public static class ShuffleBuffer implements ShuffleBufferAccess {
         private final List<byte[]> leftData = Collections.synchronizedList(new ArrayList<>());
         private final List<byte[]> rightData = Collections.synchronizedList(new ArrayList<>());
+        private final List<ShuffleBlockId> leftSequenceData = Collections.synchronizedList(new ArrayList<>());
+        private final List<ShuffleBlockId> rightSequenceData = Collections.synchronizedList(new ArrayList<>());
         private final ReentrantLock leftDataLock = new ReentrantLock();
         private final ReentrantLock rightDataLock = new ReentrantLock();
         private final Condition leftReadable = leftDataLock.newCondition();
         private final Condition rightReadable = rightDataLock.newCondition();
         private final AtomicInteger leftDoneCount = new AtomicInteger();
         private final AtomicInteger rightDoneCount = new AtomicInteger();
+        private final Set<ShuffleBlockId> leftDoneBlocks = ConcurrentHashMap.newKeySet();
+        private final Set<ShuffleBlockId> rightDoneBlocks = ConcurrentHashMap.newKeySet();
         private volatile int expectedLeftSenders = -1;
         private volatile int expectedRightSenders = -1;
         private final CountDownLatch leftReady = new CountDownLatch(1);
@@ -802,6 +902,9 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
         private final AtomicLong receivedChunks = new AtomicLong();
         private final AtomicLong spilledPayloadBytes = new AtomicLong();
         private final AtomicLong spilledChunks = new AtomicLong();
+        /** Accepted block ids per side; populated under the manager admission lock. */
+        private final Set<ShuffleBlockId> leftSequences = new HashSet<>();
+        private final Set<ShuffleBlockId> rightSequences = new HashSet<>();
 
         /**
          * Spill state. Null/disabled by default — a buffer only spills when the manager wires its
@@ -875,18 +978,39 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
          * tracked {@link #currentBytes} is read at removal time to release the reservation.
          */
         public void addData(String side, byte[] data) {
+            addData(side, data, new ShuffleBlockId("", 0L, -1L));
+        }
+
+        void addData(String side, byte[] data, ShuffleBlockId blockId) {
             int size = data == null ? 0 : data.length;
             currentBytes.addAndGet(size);
             receivedBytes.addAndGet(size);
             receivedChunks.incrementAndGet();
             List<byte[]> target = "left".equals(side) ? leftData : rightData;
+            List<ShuffleBlockId> targetSequences = "left".equals(side) ? leftSequenceData : rightSequenceData;
             ReentrantLock dataLock = dataLockFor(side);
             dataLock.lock();
             try {
                 target.add(data);
+                targetSequences.add(blockId);
                 readableConditionFor(side).signalAll();
             } finally {
                 dataLock.unlock();
+            }
+        }
+
+        /** Returns true for a previously accepted sequenced block; -1 keeps legacy sends untracked. */
+        boolean isSequenceSeen(String side, ShuffleBlockId blockId) {
+            if (blockId.isSequenced() == false) {
+                return false;
+            }
+            Set<ShuffleBlockId> sequences = "left".equals(side) ? leftSequences : rightSequences;
+            return sequences.contains(blockId);
+        }
+
+        void recordSequence(ShuffleBlockId blockId, String side) {
+            if (blockId.isSequenced()) {
+                ("left".equals(side) ? leftSequences : rightSequences).add(blockId);
             }
         }
 
@@ -954,10 +1078,12 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
                 return 0L;
             }
             List<byte[]> list = "left".equals(side) ? leftData : rightData;
+            List<ShuffleBlockId> sequences = "left".equals(side) ? leftSequenceData : rightSequenceData;
             ReentrantLock dataLock = dataLockFor(side);
             long evicted = 0L;
             while (evicted < targetBytes) {
                 byte[] chunk;
+                ShuffleBlockId blockId;
                 // Hold the side lock for the size-check + remove(0) so a concurrent producer cannot
                 // shift indices under us. The caller already holds admitLock, preserving the global
                 // admitLock -> side-lock ordering also used by live-consumer close.
@@ -967,8 +1093,9 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
                         break;
                     }
                     chunk = list.get(0);
+                    blockId = sequences.get(0);
                     int len = chunk == null ? 0 : chunk.length;
-                    // Disk footprint includes the 8-byte frame header append() writes, so the on-disk
+                    // Disk footprint includes the framed header append() writes, so the on-disk
                     // total can't silently grow past the ceiling by 8×chunkCount.
                     long diskBytes = len + SPILL_FRAME_HEADER_BYTES;
                     // Reserve disk budget BEFORE removing from memory — if the ceiling is hit we
@@ -977,6 +1104,7 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
                         throw ShuffleBufferExceededException.forDiskCeiling(owner.getSpilledTotalBytes() + diskBytes, owner.spillMaxBytes);
                     }
                     list.remove(0);
+                    sequences.remove(0);
                 } finally {
                     dataLock.unlock();
                 }
@@ -984,7 +1112,7 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
                 long diskBytes = len + SPILL_FRAME_HEADER_BYTES;
                 try {
                     SpilledSide spill = spillFor(side);
-                    spill.append(chunk);
+                    spill.append(chunk, blockId);
                     spilledPayloadBytes.addAndGet(len);
                     spilledChunks.incrementAndGet();
                 } catch (IOException e) {
@@ -1054,6 +1182,25 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
         }
 
         public void senderDone(String side) {
+            senderDone(side, new ShuffleBlockId("", 0L, -1L));
+        }
+
+        public void senderDone(String side, long producerTaskId, long sequenceNumber) {
+            senderDone(side, "", producerTaskId, sequenceNumber);
+        }
+
+        public void senderDone(String side, String producerNodeId, long producerTaskId, long sequenceNumber) {
+            senderDone(side, new ShuffleBlockId(producerNodeId == null ? "" : producerNodeId, producerTaskId, sequenceNumber));
+        }
+
+        /** Marks one producer's final marker; duplicate markers from a retried task are idempotent. */
+        private void senderDone(String side, ShuffleBlockId blockId) {
+            if (blockId.isSequenced()) {
+                Set<ShuffleBlockId> doneBlocks = "left".equals(side) ? leftDoneBlocks : rightDoneBlocks;
+                if (doneBlocks.add(blockId) == false) {
+                    return;
+                }
+            }
             if ("left".equals(side)) {
                 leftDoneCount.incrementAndGet();
                 checkCompletion("left");
@@ -1425,6 +1572,7 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
                 dataLock.lock();
                 try {
                     chunk = data.remove(0);
+                    ("left".equals(side) ? leftSequenceData : rightSequenceData).remove(0);
                 } finally {
                     dataLock.unlock();
                 }
@@ -1457,6 +1605,7 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
                         discardedBytes += chunk == null ? 0 : chunk.length;
                     }
                     data.clear();
+                    ("left".equals(side) ? leftSequenceData : rightSequenceData).clear();
                     readable.signalAll();
                 } finally {
                     dataLock.unlock();
@@ -1488,6 +1637,8 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
                 }
                 int len = in.readInt();
                 int expectedChecksum = in.readInt();
+                in.readLong(); // durable producer task identity; replay currently returns payload bytes
+                in.readLong(); // durable producer sequence; replay currently returns payload bytes
                 remaining -= SPILL_FRAME_HEADER_BYTES;
                 // Check the file size before allocating. A corrupt length must never be allowed to
                 // turn into an unbounded byte[] allocation.
@@ -1673,7 +1824,7 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
 
         /**
          * One side's on-disk spill file: a sequence of framed Arrow-IPC chunks
-         * ({@code int length} big-endian, {@code int CRC32C}, then {@code length} bytes), appended in
+         * ({@code int length} big-endian, {@code int CRC32C}, {@code long producerTaskId}, {@code long sequence}, then {@code length} bytes), appended in
          * arrival order. Each chunk is already a self-describing Arrow IPC stream; the length splits
          * the concatenation and the checksum rejects truncated or corrupted frames.
          *
@@ -1695,7 +1846,7 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
             }
 
             /** Appends one length-and-checksum framed chunk and flushes so it is readable at drain. */
-            void append(byte[] chunk) throws IOException {
+            void append(byte[] chunk, ShuffleBlockId blockId) throws IOException {
                 int len = chunk == null ? 0 : chunk.length;
                 CRC32C checksum = new CRC32C();
                 checksum.update(chunk == null ? new byte[0] : chunk, 0, len);
@@ -1709,13 +1860,26 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
                 out.write((checksumValue >>> 16) & 0xFF);
                 out.write((checksumValue >>> 8) & 0xFF);
                 out.write(checksumValue & 0xFF);
+                writeLong(out, blockId.producerTaskId());
+                writeLong(out, blockId.sequenceNumber());
                 if (len > 0) {
                     out.write(chunk);
                 }
                 out.flush();
                 // Include the frame header so bytesOnDisk (released on cleanup) matches the framed size
-                // reserved in spillOldest — else cleanup under-releases by 8×chunkCount.
+                // reserved in spillOldest.
                 bytesOnDisk += len + SPILL_FRAME_HEADER_BYTES;
+            }
+
+            private static void writeLong(OutputStream out, long value) throws IOException {
+                out.write((int) (value >>> 56) & 0xFF);
+                out.write((int) (value >>> 48) & 0xFF);
+                out.write((int) (value >>> 40) & 0xFF);
+                out.write((int) (value >>> 32) & 0xFF);
+                out.write((int) (value >>> 24) & 0xFF);
+                out.write((int) (value >>> 16) & 0xFF);
+                out.write((int) (value >>> 8) & 0xFF);
+                out.write((int) value & 0xFF);
             }
 
             /**

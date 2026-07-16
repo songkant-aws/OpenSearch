@@ -88,6 +88,10 @@ public class TransportAnalyticsShuffleDataAction extends HandledTransportAction<
                 request.getSide(),
                 request.getPartitionIndex(),
                 request.getData(),
+                request.getSequenceNumber(),
+                request.getProducerAttempt(),
+                request.getProducerTaskId(),
+                request.getProducerNodeId(),
                 request.isLast(),
                 /* targetNodeId */ null
             );
@@ -139,7 +143,11 @@ public class TransportAnalyticsShuffleDataAction extends HandledTransportAction<
                     request.getTargetStageId(),
                     request.getPartitionIndex(),
                     request.getSide(),
-                    request.getData()
+                    request.getData(),
+                    request.getSequenceNumber(),
+                    request.getProducerAttempt(),
+                    request.getProducerTaskId(),
+                    request.getProducerNodeId()
                 );
                 if (admit == ShuffleBufferManager.AdmitResult.REJECT_RETRY) {
                     logger.debug(
@@ -161,7 +169,7 @@ public class TransportAnalyticsShuffleDataAction extends HandledTransportAction<
                     request.getTargetStageId(),
                     request.getPartitionIndex()
                 );
-                buffer.senderDone(request.getSide());
+                buffer.senderDone(request.getSide(), request.getProducerNodeId(), request.getProducerTaskId(), request.getSequenceNumber());
                 logger.debug(
                     "Shuffle sender done: query={}, stage={}, partition={}, side={}",
                     request.getQueryId(),

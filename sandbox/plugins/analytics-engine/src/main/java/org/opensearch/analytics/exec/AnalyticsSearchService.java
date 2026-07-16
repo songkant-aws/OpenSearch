@@ -456,6 +456,7 @@ public class AnalyticsSearchService implements AutoCloseable {
                 SearchExecEngine<ShardScanExecutionContext, EngineResultStream> engine = null;
                 EngineResultStream stream = null;
                 BackendExecutionContext backendContext = null;
+                boolean completed = false;
                 try {
                     FragmentExecutionRequest.PlanAlternative plan = selectWorkerPlan(request);
                     AnalyticsSearchBackendPlugin backend = backends.get(plan.getBackendId());
@@ -485,7 +486,8 @@ public class AnalyticsSearchService implements AutoCloseable {
                         backendContext,
                         ctx,
                         request.getQueryId(),
-                        request.getStageId()
+                        request.getStageId(),
+                        request.getAttempt()
                     );
                     ExchangeSink partitionedSink = producer.partitionedSink();
                     backendContext = producer.engineContext();
@@ -513,6 +515,7 @@ public class AnalyticsSearchService implements AutoCloseable {
                     } else {
                         responseHandler.onComplete();
                     }
+                    completed = true;
                 } catch (Exception e) {
                     LOGGER.error(
                         () -> new org.apache.logging.log4j.message.ParameterizedMessage(
@@ -543,11 +546,12 @@ public class AnalyticsSearchService implements AutoCloseable {
                     // Free the shuffle buffer this worker task consumed (keyed by the worker's own
                     // stage + partition). The buffer holds the partition's payload as on-heap
                     // byte[]; without this it lives for the JVM's lifetime and accumulates across
-                    // queries → OOM. Runs on success AND failure (both hit this finally). The
-                    // per-query clearForQuery backstop (cancellation path) covers tasks that never
-                    // reach here. Guarded for non-shuffle workers (registry null / no such buffer →
+                    // queries → OOM. On a failed attempt retain the buffer: the scheduler may retry
+                    // this worker, and the native SingleReceiverPartition can replay its durable
+                    // prefix. Terminal query cleanup/cancellation clears it after retries are
+                    // exhausted. Guarded for non-shuffle workers (registry null / no such buffer →
                     // idempotent no-op).
-                    if (shuffleBufferRegistry != null) {
+                    if (completed && shuffleBufferRegistry != null) {
                         try {
                             shuffleBufferRegistry.removeBuffer(request.getQueryId(), request.getStageId(), request.getPartitionIndex());
                         } catch (Exception ignore) {}
@@ -812,7 +816,14 @@ public class AnalyticsSearchService implements AutoCloseable {
             // partitioned sink, and unwrap the carrier so the engine factory sees the upstream
             // session state (not the carrier). The drain into the sink happens later in
             // executeFragmentStreamingAsync; we just attach the sink to FragmentResources here.
-            ProducerSinkResolution producer = resolveProducerSink(backend, backendContext, ctx, resolved.queryId, resolved.stageId);
+            ProducerSinkResolution producer = resolveProducerSink(
+                backend,
+                backendContext,
+                ctx,
+                resolved.queryId,
+                resolved.stageId,
+                request.getAttempt()
+            );
             ExchangeSink partitionedSink = producer.partitionedSink();
             backendContext = producer.engineContext();
 
@@ -870,7 +881,8 @@ public class AnalyticsSearchService implements AutoCloseable {
         ShuffleProducerOutputState producerState,
         ShardScanExecutionContext ctx,
         String queryId,
-        int stageId
+        int stageId,
+        int producerAttempt
     ) {
         ShuffleSender sender = new ShuffleSenderImpl(
             client,
@@ -878,7 +890,8 @@ public class AnalyticsSearchService implements AutoCloseable {
             clusterService,
             producerState.getQueryId(),
             producerState.getTargetStageId(),
-            producerState.getSide()
+            producerState.getSide(),
+            producerAttempt
         );
         // Producer's ExchangeSinkContext carries no child inputs (the producer IS the source) and
         // no downstream sink (the partitioned sink ships out-of-band via the ShuffleSender, not
@@ -925,7 +938,8 @@ public class AnalyticsSearchService implements AutoCloseable {
         BackendExecutionContext backendContext,
         ShardScanExecutionContext ctx,
         String queryId,
-        int stageId
+        int stageId,
+        int producerAttempt
     ) {
         if (backendContext instanceof ShuffleProducerOutputState producerState) {
             if (client == null || threadPool == null || clusterService == null) {
@@ -934,7 +948,7 @@ public class AnalyticsSearchService implements AutoCloseable {
                         + "setShuffleSenderDeps(client, threadPool, clusterService) must be called at plugin startup"
                 );
             }
-            ExchangeSink partitionedSink = buildPartitionedSink(backend, producerState, ctx, queryId, stageId);
+            ExchangeSink partitionedSink = buildPartitionedSink(backend, producerState, ctx, queryId, stageId, producerAttempt);
             // Engine sees the upstream session state, not the carrier.
             return new ProducerSinkResolution(partitionedSink, producerState.getDelegate());
         }

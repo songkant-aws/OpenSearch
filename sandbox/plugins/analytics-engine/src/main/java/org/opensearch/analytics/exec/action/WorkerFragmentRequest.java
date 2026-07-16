@@ -25,7 +25,7 @@ import java.util.Map;
  * Transport request for a hash-shuffle worker fragment. Carries the per-task plan alternatives
  * and partition index — no {@code shardId}, since a worker fragment never scans a shard.
  *
- * <p>Wire shape: {@code (queryId, stageId, partitionIndex, planAlternatives, profile)}. The
+ * <p>Wire shape: {@code (queryId, stageId, partitionIndex, planAlternatives, profile, attempt)}. The
  * data-node-side handler in {@code AnalyticsSearchTransportService} routes this to
  * {@code AnalyticsSearchService.executeWorkerFragmentStreamingAsync}, which skips
  * {@code IndicesService.getShard} and reader acquisition entirely.
@@ -39,6 +39,7 @@ public class WorkerFragmentRequest extends ActionRequest {
     private final int partitionIndex;
     private final List<FragmentExecutionRequest.PlanAlternative> planAlternatives;
     private final boolean profile;
+    private final int attempt;
 
     public WorkerFragmentRequest(
         String queryId,
@@ -47,11 +48,23 @@ public class WorkerFragmentRequest extends ActionRequest {
         List<FragmentExecutionRequest.PlanAlternative> planAlternatives,
         boolean profile
     ) {
+        this(queryId, stageId, partitionIndex, planAlternatives, profile, 0);
+    }
+
+    public WorkerFragmentRequest(
+        String queryId,
+        int stageId,
+        int partitionIndex,
+        List<FragmentExecutionRequest.PlanAlternative> planAlternatives,
+        boolean profile,
+        int attempt
+    ) {
         this.queryId = queryId;
         this.stageId = stageId;
         this.partitionIndex = partitionIndex;
         this.planAlternatives = planAlternatives;
         this.profile = profile;
+        this.attempt = attempt;
     }
 
     public WorkerFragmentRequest(StreamInput in) throws IOException {
@@ -65,6 +78,7 @@ public class WorkerFragmentRequest extends ActionRequest {
             planAlternatives.add(new FragmentExecutionRequest.PlanAlternative(in));
         }
         this.profile = in.readBoolean();
+        this.attempt = in.readVInt();
     }
 
     @Override
@@ -78,6 +92,7 @@ public class WorkerFragmentRequest extends ActionRequest {
             alt.writeTo(out);
         }
         out.writeBoolean(profile);
+        out.writeVInt(attempt);
     }
 
     public String getQueryId() {
@@ -100,9 +115,13 @@ public class WorkerFragmentRequest extends ActionRequest {
         return profile;
     }
 
+    public int getAttempt() {
+        return attempt;
+    }
+
     @Override
     public Task createTask(long id, String type, String action, TaskId parentTaskId, Map<String, String> headers) {
-        String desc = "queryId[" + queryId + "] stageId[" + stageId + "] partition[" + partitionIndex + "]";
+        String desc = "queryId[" + queryId + "] stageId[" + stageId + "] partition[" + partitionIndex + "] attempt[" + attempt + "]";
         return new AnalyticsShardTask(id, type, action, desc, parentTaskId, headers);
     }
 

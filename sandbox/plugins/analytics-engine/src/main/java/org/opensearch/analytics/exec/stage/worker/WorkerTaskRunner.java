@@ -18,7 +18,7 @@ import org.opensearch.core.action.ActionListener;
 
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.Function;
+import java.util.function.BiFunction;
 
 /**
  * Worker-kind task runner: opens an Arrow Flight stream per task. Sibling of
@@ -33,14 +33,14 @@ public final class WorkerTaskRunner implements TaskRunner<WorkerStageTask> {
     private final WorkerFragmentStageExecution stage;
     private final QueryContext config;
     private final AnalyticsSearchTransportService transport;
-    private final Function<WorkerExecutionTarget, WorkerFragmentRequest> requestBuilder;
+    private final BiFunction<WorkerStageTask, WorkerExecutionTarget, WorkerFragmentRequest> requestBuilder;
     private final Map<String, PendingExecutions> pendingPerNode = new ConcurrentHashMap<>();
 
     public WorkerTaskRunner(
         WorkerFragmentStageExecution stage,
         QueryContext config,
         AnalyticsSearchTransportService transport,
-        Function<WorkerExecutionTarget, WorkerFragmentRequest> requestBuilder
+        BiFunction<WorkerStageTask, WorkerExecutionTarget, WorkerFragmentRequest> requestBuilder
     ) {
         this.stage = stage;
         this.config = config;
@@ -51,7 +51,7 @@ public final class WorkerTaskRunner implements TaskRunner<WorkerStageTask> {
     @Override
     public void run(WorkerStageTask task, ActionListener<Void> listener) {
         WorkerExecutionTarget target = task.target();
-        WorkerFragmentRequest request = requestBuilder.apply(target);
+        WorkerFragmentRequest request = requestBuilder.apply(task, target);
         PendingExecutions pending = pendingFor(target);
         transport.dispatchWorkerFragmentStreaming(
             request,

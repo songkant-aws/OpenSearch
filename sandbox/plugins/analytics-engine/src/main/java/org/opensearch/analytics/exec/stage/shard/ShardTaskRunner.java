@@ -18,6 +18,7 @@ import org.opensearch.core.action.ActionListener;
 
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BiFunction;
 import java.util.function.Function;
 
 /**
@@ -32,14 +33,14 @@ public final class ShardTaskRunner implements TaskRunner<ShardStageTask> {
     private final ShardFragmentStageExecution stage;
     private final QueryContext config;
     private final AnalyticsSearchTransportService transport;
-    private final Function<ShardExecutionTarget, FragmentExecutionRequest> requestBuilder;
+    private final BiFunction<ShardStageTask, ShardExecutionTarget, FragmentExecutionRequest> requestBuilder;
     private final Map<String, PendingExecutions> pendingPerNode = new ConcurrentHashMap<>();
 
     public ShardTaskRunner(
         ShardFragmentStageExecution stage,
         QueryContext config,
         AnalyticsSearchTransportService transport,
-        Function<ShardExecutionTarget, FragmentExecutionRequest> requestBuilder
+        BiFunction<ShardStageTask, ShardExecutionTarget, FragmentExecutionRequest> requestBuilder
     ) {
         this.stage = stage;
         this.config = config;
@@ -50,7 +51,7 @@ public final class ShardTaskRunner implements TaskRunner<ShardStageTask> {
     @Override
     public void run(ShardStageTask task, ActionListener<Void> listener) {
         ShardExecutionTarget target = (ShardExecutionTarget) task.target();
-        FragmentExecutionRequest request = requestBuilder.apply(target);
+        FragmentExecutionRequest request = requestBuilder.apply(task, target);
         PendingExecutions pending = pendingFor(target);
         transport.dispatchFragmentStreaming(
             request,
@@ -66,5 +67,15 @@ public final class ShardTaskRunner implements TaskRunner<ShardStageTask> {
             target.node().getId(),
             n -> new PendingExecutions(config.maxConcurrentShardRequestsPerNode())
         );
+    }
+
+    /** Compatibility constructor for callers that do not stamp an attempt number. */
+    public ShardTaskRunner(
+        ShardFragmentStageExecution stage,
+        QueryContext config,
+        AnalyticsSearchTransportService transport,
+        Function<ShardExecutionTarget, FragmentExecutionRequest> requestBuilder
+    ) {
+        this(stage, config, transport, (task, target) -> requestBuilder.apply(target));
     }
 }

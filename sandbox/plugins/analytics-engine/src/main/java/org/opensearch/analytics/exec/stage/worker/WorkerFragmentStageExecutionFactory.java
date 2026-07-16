@@ -25,7 +25,7 @@ import org.opensearch.cluster.service.ClusterService;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.function.Function;
+import java.util.function.BiFunction;
 
 /**
  * Builds a {@link WorkerFragmentStageExecution} that fans out one fragment request per
@@ -50,10 +50,10 @@ public final class WorkerFragmentStageExecutionFactory implements StageExecution
     public StageExecution createExecution(Stage stage, ExchangeSink sink, QueryContext config) {
         final String queryId = config.queryId();
         final int stageId = stage.getStageId();
-        Function<WorkerExecutionTarget, WorkerFragmentRequest> requestBuilder = target -> {
+        BiFunction<WorkerStageTask, WorkerExecutionTarget, WorkerFragmentRequest> requestBuilder = (task, target) -> {
             int partitionIndex = target.partitionIndex();
             List<FragmentExecutionRequest.PlanAlternative> filtered = filterPlanAlternativesForPartition(stage, partitionIndex);
-            return new WorkerFragmentRequest(queryId, stageId, partitionIndex, filtered, config.profile());
+            return new WorkerFragmentRequest(queryId, stageId, partitionIndex, filtered, config.profile(), task.attempt());
         };
         return new WorkerFragmentStageExecution(stage, config, sink, clusterService, requestBuilder, transport);
     }

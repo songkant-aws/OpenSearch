@@ -21,7 +21,8 @@ import java.io.IOException;
  * {@code ShuffleDataRequest}.
  *
  * <p>Wire shape: {@code queryId, targetStageId, side ("left"/"right"), int partitionIndex,
- * byte[] data, boolean isLast}.
+ * byte[] data, long sequenceNumber, int producerAttempt, long producerTaskId, String producerNodeId,
+ * boolean isLast}.
  *
  * @opensearch.internal
  */
@@ -32,11 +33,15 @@ public class AnalyticsShuffleDataRequest extends ActionRequest {
     private final String side;
     private final int partitionIndex;
     private final byte[] data;
+    private final long sequenceNumber;
+    private final int producerAttempt;
+    private final long producerTaskId;
+    private final String producerNodeId;
     private final boolean isLast;
     private final String targetNodeId;
 
     public AnalyticsShuffleDataRequest(String queryId, int targetStageId, String side, int partitionIndex, byte[] data, boolean isLast) {
-        this(queryId, targetStageId, side, partitionIndex, data, isLast, null);
+        this(queryId, targetStageId, side, partitionIndex, data, -1L, 0, 0L, "", isLast, null);
     }
 
     public AnalyticsShuffleDataRequest(
@@ -48,11 +53,73 @@ public class AnalyticsShuffleDataRequest extends ActionRequest {
         boolean isLast,
         String targetNodeId
     ) {
+        this(queryId, targetStageId, side, partitionIndex, data, -1L, 0, 0L, "", isLast, targetNodeId);
+    }
+
+    public AnalyticsShuffleDataRequest(
+        String queryId,
+        int targetStageId,
+        String side,
+        int partitionIndex,
+        byte[] data,
+        long sequenceNumber,
+        boolean isLast,
+        String targetNodeId
+    ) {
+        this(queryId, targetStageId, side, partitionIndex, data, sequenceNumber, 0, 0L, "", isLast, targetNodeId);
+    }
+
+    public AnalyticsShuffleDataRequest(
+        String queryId,
+        int targetStageId,
+        String side,
+        int partitionIndex,
+        byte[] data,
+        long sequenceNumber,
+        int producerAttempt,
+        boolean isLast,
+        String targetNodeId
+    ) {
+        this(queryId, targetStageId, side, partitionIndex, data, sequenceNumber, producerAttempt, 0L, "", isLast, targetNodeId);
+    }
+
+    public AnalyticsShuffleDataRequest(
+        String queryId,
+        int targetStageId,
+        String side,
+        int partitionIndex,
+        byte[] data,
+        long sequenceNumber,
+        int producerAttempt,
+        long producerTaskId,
+        boolean isLast,
+        String targetNodeId
+    ) {
+        this(queryId, targetStageId, side, partitionIndex, data, sequenceNumber, producerAttempt, producerTaskId, "", isLast, targetNodeId);
+    }
+
+    public AnalyticsShuffleDataRequest(
+        String queryId,
+        int targetStageId,
+        String side,
+        int partitionIndex,
+        byte[] data,
+        long sequenceNumber,
+        int producerAttempt,
+        long producerTaskId,
+        String producerNodeId,
+        boolean isLast,
+        String targetNodeId
+    ) {
         this.queryId = queryId;
         this.targetStageId = targetStageId;
         this.side = side;
         this.partitionIndex = partitionIndex;
         this.data = data;
+        this.sequenceNumber = sequenceNumber;
+        this.producerAttempt = producerAttempt;
+        this.producerTaskId = producerTaskId;
+        this.producerNodeId = producerNodeId == null ? "" : producerNodeId;
         this.isLast = isLast;
         this.targetNodeId = targetNodeId;
     }
@@ -68,6 +135,11 @@ public class AnalyticsShuffleDataRequest extends ActionRequest {
         } else {
             this.data = null;
         }
+        this.sequenceNumber = in.readLong();
+        this.producerAttempt = in.readVInt();
+        this.producerTaskId = in.readLong();
+        String producerNode = in.readOptionalString();
+        this.producerNodeId = producerNode == null ? "" : producerNode;
         this.isLast = in.readBoolean();
         this.targetNodeId = in.readOptionalString();
     }
@@ -85,6 +157,10 @@ public class AnalyticsShuffleDataRequest extends ActionRequest {
         } else {
             out.writeBoolean(false);
         }
+        out.writeLong(sequenceNumber);
+        out.writeVInt(producerAttempt);
+        out.writeLong(producerTaskId);
+        out.writeOptionalString(producerNodeId.isEmpty() ? null : producerNodeId);
         out.writeBoolean(isLast);
         out.writeOptionalString(targetNodeId);
     }
@@ -119,6 +195,23 @@ public class AnalyticsShuffleDataRequest extends ActionRequest {
 
     public byte[] getData() {
         return data;
+    }
+
+    /** Stable producer-side block sequence; -1 denotes a legacy unsequenced sender. */
+    public long getSequenceNumber() {
+        return sequenceNumber;
+    }
+
+    public int getProducerAttempt() {
+        return producerAttempt;
+    }
+
+    public long getProducerTaskId() {
+        return producerTaskId;
+    }
+
+    public String getProducerNodeId() {
+        return producerNodeId;
     }
 
     public boolean isLast() {

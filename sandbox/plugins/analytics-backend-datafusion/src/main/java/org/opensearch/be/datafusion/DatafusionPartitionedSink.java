@@ -72,6 +72,8 @@ public final class DatafusionPartitionedSink implements ExchangeSink {
     private final ShuffleSender sender;
     private final String logTag;
     private final ShuffleCompression.Config compression;
+    private final long[] nextSequence;
+    private final long producerTaskId;
 
     private final AtomicInteger pending = new AtomicInteger(0);
     private final AtomicReference<Throwable> firstError = new AtomicReference<>();
@@ -103,6 +105,19 @@ public final class DatafusionPartitionedSink implements ExchangeSink {
         String logTag,
         ShuffleCompression.Config compression
     ) {
+        this(alloc, hashKeyChannels, partitionCount, targetWorkerNodeIds, sender, logTag, compression, 0L);
+    }
+
+    public DatafusionPartitionedSink(
+        BufferAllocator alloc,
+        List<Integer> hashKeyChannels,
+        int partitionCount,
+        List<String> targetWorkerNodeIds,
+        ShuffleSender sender,
+        String logTag,
+        ShuffleCompression.Config compression,
+        long producerTaskId
+    ) {
         if (targetWorkerNodeIds.size() != partitionCount) {
             throw new IllegalArgumentException(
                 "targetWorkerNodeIds.size() (" + targetWorkerNodeIds.size() + ") must equal partitionCount (" + partitionCount + ")"
@@ -115,6 +130,8 @@ public final class DatafusionPartitionedSink implements ExchangeSink {
         this.sender = sender;
         this.logTag = logTag;
         this.compression = compression;
+        this.nextSequence = new long[partitionCount];
+        this.producerTaskId = producerTaskId;
     }
 
     @Override
@@ -257,7 +274,8 @@ public final class DatafusionPartitionedSink implements ExchangeSink {
     private void shipPayload(int partitionIndex, byte[] data, boolean isLast) {
         String targetNodeId = targetWorkerNodeIds.get(partitionIndex);
         pending.incrementAndGet();
-        sender.send(targetNodeId, partitionIndex, data, isLast, new ActionListener<>() {
+        long sequence = nextSequence[partitionIndex]++;
+        sender.send(targetNodeId, partitionIndex, data, sequence, producerTaskId, isLast, new ActionListener<>() {
             @Override
             public void onResponse(Void unused) {
                 pending.decrementAndGet();

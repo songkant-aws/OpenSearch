@@ -22,7 +22,7 @@ import java.util.concurrent.TimeUnit;
 
 public class ShuffleBufferManagerTests extends OpenSearchTestCase {
 
-    private static final int SPILL_FRAME_HEADER_BYTES = Integer.BYTES * 2;
+    private static final int SPILL_FRAME_HEADER_BYTES = Integer.BYTES * 2 + Long.BYTES * 2;
 
     public void testPartitionStatsTrackReceivedAndSpilledChunks() throws Exception {
         Path spillDir = createTempDir();
@@ -192,6 +192,28 @@ public class ShuffleBufferManagerTests extends OpenSearchTestCase {
         assertEquals(AdmitResult.ACCEPTED, mgr.tryAdmit("q1", 0, 0, "left", new byte[10_000]));
         assertEquals(AdmitResult.ACCEPTED, mgr.tryAdmit("q1", 0, 0, "right", new byte[10_000]));
         assertEquals(20_000L, mgr.getTotalBytes());
+    }
+
+    /** Retries of one sequenced block must not duplicate payload bytes or budget reservations. */
+    public void testSequencedAdmissionDeduplicatesRetransmission() {
+        ShuffleBufferManager mgr = new ShuffleBufferManager();
+        mgr.setBudgets(100, 100);
+        byte[] payload = new byte[12];
+        assertEquals(AdmitResult.ACCEPTED, mgr.tryAdmit("q1", 0, 0, "left", payload, 7L, 42L, "source-a"));
+        assertEquals(AdmitResult.ACCEPTED, mgr.tryAdmit("q1", 0, 0, "left", payload, 7L, 42L, "source-a"));
+        assertEquals(12L, mgr.getTotalBytes());
+        assertEquals(1, mgr.getBuffer("q1", 0, 0).getLeftData().size());
+        mgr.clearForQuery("q1");
+    }
+
+    /** The same sequence number from two producers must not be treated as a duplicate. */
+    public void testSequencedAdmissionKeepsDifferentProducersDistinct() {
+        ShuffleBufferManager mgr = new ShuffleBufferManager();
+        mgr.setBudgets(100, 100);
+        assertEquals(AdmitResult.ACCEPTED, mgr.tryAdmit("q1", 0, 0, "left", new byte[] { 1 }, 0L, 10L, "source-a"));
+        assertEquals(AdmitResult.ACCEPTED, mgr.tryAdmit("q1", 0, 0, "left", new byte[] { 2 }, 0L, 10L, "source-b"));
+        assertEquals(2L, mgr.getTotalBytes());
+        mgr.clearForQuery("q1");
     }
 
     /** removeBuffer releases that buffer's reserved bytes back to the node + per-query budgets. */
@@ -477,20 +499,20 @@ public class ShuffleBufferManagerTests extends OpenSearchTestCase {
         Path spillDir = createTempDir();
         ShuffleBufferManager mgr = new ShuffleBufferManager();
         mgr.setBudgets(10_000, 100);
-        // Disk ceiling of 60 bytes. Each spilled 50-byte chunk costs 58 bytes on disk (50 payload + an
-        // 8-byte length/checksum frame), so the first spill (58 <= 60) fits and the second (116 > 60) breaches.
-        mgr.setSpillConfig(true, spillDir, /* maxBytes */ 60);
+        // Disk ceiling of 80 bytes. Each spilled 50-byte chunk costs 74 bytes on disk (50 payload + a
+        // 24-byte length/checksum/producer-id/sequence frame), so the first spill fits and the second breaches.
+        mgr.setSpillConfig(true, spillDir, /* maxBytes */ 80);
         // Fill the budget: 100 bytes resident (chunks 0,1 of 50 each). Under budget so far.
         mgr.tryAdmit("q1", 0, 0, "left", chunk(0, 50));
         mgr.tryAdmit("q1", 0, 0, "left", chunk(1, 50));
         assertEquals(100L, mgr.getTotalBytes());
-        // Next chunk forces eviction of one chunk to disk → spilled total 58 (fits the 60 ceiling).
-        mgr.tryAdmit("q1", 0, 0, "left", chunk(2, 50)); // spills chunk 0 (58 <= 60 ceiling)
+        // Next chunk forces eviction of one chunk to disk → spilled total 74 (fits the 80 ceiling).
+        mgr.tryAdmit("q1", 0, 0, "left", chunk(2, 50)); // spills chunk 0 (74 <= 80 ceiling)
         ShuffleBufferExceededException ex = expectThrows(
             ShuffleBufferExceededException.class,
-            () -> mgr.tryAdmit("q1", 0, 0, "left", chunk(3, 50)) // would spill a 2nd chunk → 116 > 60
+            () -> mgr.tryAdmit("q1", 0, 0, "left", chunk(3, 50)) // would spill a 2nd chunk → 132 > 70
         );
-        assertEquals("disk-ceiling exception names the spill.max_bytes limit", 60L, ex.limitBytes());
+        assertEquals("disk-ceiling exception names the spill.max_bytes limit", 80L, ex.limitBytes());
         // Terminal cleanup (as the coordinator does on failure) closes + deletes the open spill file.
         mgr.clearForQuery("q1");
         assertEquals("no .spill file may survive the terminal", 0L, countSpillFiles(spillDir.resolve("q1")));

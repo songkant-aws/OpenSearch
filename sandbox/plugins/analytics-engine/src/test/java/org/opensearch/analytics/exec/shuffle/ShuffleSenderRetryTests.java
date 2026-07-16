@@ -10,6 +10,7 @@ package org.opensearch.analytics.exec.shuffle;
 
 import org.opensearch.analytics.exec.action.AnalyticsShuffleDataRequest;
 import org.opensearch.analytics.exec.action.AnalyticsShuffleDataResponse;
+import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -85,6 +86,32 @@ public class ShuffleSenderRetryTests extends OpenSearchTestCase {
         assertEquals(1, sendAttempts.get());
         assertEquals(1, failures.size());
         assertTrue(failures.get(0).getMessage().contains("node unreachable"));
+    }
+
+    public void testShuffleBlockIdentityPreservesAttemptAndSequenceOnWire() throws Exception {
+        AnalyticsShuffleDataRequest request = new AnalyticsShuffleDataRequest(
+            "q1",
+            0,
+            "left",
+            0,
+            new byte[] { 1 },
+            11L,
+            4,
+            99L,
+            "source-node",
+            false,
+            "node"
+        );
+        try (BytesStreamOutput out = new BytesStreamOutput()) {
+            request.writeTo(out);
+            try (var in = out.bytes().streamInput()) {
+                AnalyticsShuffleDataRequest restored = new AnalyticsShuffleDataRequest(in);
+                assertEquals(11L, restored.getSequenceNumber());
+                assertEquals(4, restored.getProducerAttempt());
+                assertEquals(99L, restored.getProducerTaskId());
+                assertEquals("source-node", restored.getProducerNodeId());
+            }
+        }
     }
 
     /** Runs the retry inline, no sleep — tests focus on retry logic, not timing. */

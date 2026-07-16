@@ -29,6 +29,7 @@ import org.opensearch.core.action.ActionListener;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.BiFunction;
 import java.util.function.Function;
 
 /**
@@ -49,7 +50,7 @@ public class ShardFragmentStageExecution extends AbstractStageExecution implemen
         QueryContext config,
         ExchangeSink outputSink,
         ClusterService clusterService,
-        Function<ShardExecutionTarget, FragmentExecutionRequest> requestBuilder,
+        BiFunction<ShardStageTask, ShardExecutionTarget, FragmentExecutionRequest> requestBuilder,
         AnalyticsSearchTransportService dispatcher
     ) {
         super(stage, config.queryId(), config.operationListeners(), config.parentTask());
@@ -57,6 +58,18 @@ public class ShardFragmentStageExecution extends AbstractStageExecution implemen
         this.outputSink = outputSink;
         this.clusterService = clusterService;
         this.runner = new ShardTaskRunner(this, config, dispatcher, requestBuilder);
+    }
+
+    /** Compatibility constructor for callers that do not stamp an attempt number. */
+    public ShardFragmentStageExecution(
+        Stage stage,
+        QueryContext config,
+        ExchangeSink outputSink,
+        ClusterService clusterService,
+        Function<ShardExecutionTarget, FragmentExecutionRequest> requestBuilder,
+        AnalyticsSearchTransportService dispatcher
+    ) {
+        this(stage, config, outputSink, clusterService, (task, target) -> requestBuilder.apply(target), dispatcher);
     }
 
     @Override
@@ -102,7 +115,7 @@ public class ShardFragmentStageExecution extends AbstractStageExecution implemen
         // Update the resolved target so downstream stages (LM fetch) route to the node
         // that will run the retry, not the original primary that failed.
         config.updateResolvedTarget(getStageId(), shardTarget.ordinal(), nextCopy);
-        return Optional.of(new ShardStageTask(shardTask.id(), nextCopy));
+        return Optional.of(shardTask.nextAttempt(nextCopy));
     }
 
     // FOLLOW-UP: per-stage cancel granularity. Today AbstractStageExecution.cancel cancels

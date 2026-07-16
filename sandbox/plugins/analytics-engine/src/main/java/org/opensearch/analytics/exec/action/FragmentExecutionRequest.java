@@ -28,7 +28,8 @@ import java.util.Map;
 /**
  * Transport request carrying plan fragment alternatives to a data node for shard-level execution.
  *
- * <p>Each {@link PlanAlternative} represents a backend-specific serialized plan produced by
+ * <p>Each request also carries a task attempt so producer-side shuffle blocks can be attributed to
+ * the retry that emitted them. Each {@link PlanAlternative} represents a backend-specific serialized plan produced by
  * {@code FragmentConversionDriver}. The data node selects the best alternative based on
  * available backend capabilities.
  *
@@ -41,17 +42,30 @@ public class FragmentExecutionRequest extends ActionRequest implements ShardInvo
     private final ShardId shardId;
     private final List<PlanAlternative> planAlternatives;
     private final boolean profile;
+    private final int attempt;
 
     public FragmentExecutionRequest(String queryId, int stageId, ShardId shardId, List<PlanAlternative> planAlternatives) {
         this(queryId, stageId, shardId, planAlternatives, false);
     }
 
     public FragmentExecutionRequest(String queryId, int stageId, ShardId shardId, List<PlanAlternative> planAlternatives, boolean profile) {
+        this(queryId, stageId, shardId, planAlternatives, profile, 0);
+    }
+
+    public FragmentExecutionRequest(
+        String queryId,
+        int stageId,
+        ShardId shardId,
+        List<PlanAlternative> planAlternatives,
+        boolean profile,
+        int attempt
+    ) {
         this.queryId = queryId;
         this.stageId = stageId;
         this.shardId = shardId;
         this.planAlternatives = planAlternatives;
         this.profile = profile;
+        this.attempt = attempt;
     }
 
     public FragmentExecutionRequest(StreamInput in) throws IOException {
@@ -65,6 +79,7 @@ public class FragmentExecutionRequest extends ActionRequest implements ShardInvo
             planAlternatives.add(new PlanAlternative(in));
         }
         this.profile = in.readBoolean();
+        this.attempt = in.readVInt();
     }
 
     @Override
@@ -78,6 +93,7 @@ public class FragmentExecutionRequest extends ActionRequest implements ShardInvo
             alt.writeTo(out);
         }
         out.writeBoolean(profile);
+        out.writeVInt(attempt);
     }
 
     public String getQueryId() {
@@ -100,9 +116,13 @@ public class FragmentExecutionRequest extends ActionRequest implements ShardInvo
         return profile;
     }
 
+    public int getAttempt() {
+        return attempt;
+    }
+
     @Override
     public Task createTask(long id, String type, String action, TaskId parentTaskId, Map<String, String> headers) {
-        String desc = "queryId[" + queryId + "] stageId[" + stageId + "] shardId[" + shardId + "]";
+        String desc = "queryId[" + queryId + "] stageId[" + stageId + "] shardId[" + shardId + "] attempt[" + attempt + "]";
         return new AnalyticsShardTask(id, type, action, desc, parentTaskId, headers);
     }
 

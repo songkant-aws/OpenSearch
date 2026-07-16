@@ -22,13 +22,27 @@ import org.opensearch.analytics.planner.dag.ExecutionTarget;
 public final class ShardStageTask extends StageTask {
 
     private final ExecutionTarget target;
+    private final int attempt;
 
     public ShardStageTask(StageTaskId id, ExecutionTarget target) {
+        this(id, target, 0);
+    }
+
+    public ShardStageTask(StageTaskId id, ExecutionTarget target, int attempt) {
         super(id);
         this.target = target;
+        this.attempt = attempt;
     }
 
     public ExecutionTarget target() {
         return target;
+    }
+
+    public int attempt() {
+        return attempt;
+    }
+
+    public ShardStageTask nextAttempt(ExecutionTarget nextTarget) {
+        return new ShardStageTask(id(), nextTarget, attempt + 1);
     }
 }

@@ -50,4 +50,56 @@ public interface ShuffleSender {
      *                           once per call.
      */
     void send(String targetWorkerNodeId, int partitionIndex, byte[] data, boolean isLast, ActionListener<Void> listener);
+
+    /** Ships a block with a stable producer sequence number for receiver-side deduplication. */
+    default void send(
+        String targetWorkerNodeId,
+        int partitionIndex,
+        byte[] data,
+        long sequenceNumber,
+        boolean isLast,
+        ActionListener<Void> listener
+    ) {
+        send(targetWorkerNodeId, partitionIndex, data, isLast, listener);
+    }
+
+    /** Ships a block with both producer attempt and block sequence identity. */
+    default void send(
+        String targetWorkerNodeId,
+        int partitionIndex,
+        byte[] data,
+        long sequenceNumber,
+        int producerAttempt,
+        boolean isLast,
+        ActionListener<Void> listener
+    ) {
+        send(targetWorkerNodeId, partitionIndex, data, sequenceNumber, producerAttempt, 0L, isLast, listener);
+    }
+
+    /** Ships a block with a producer task id, attempt and sequence for receiver-side deduplication. */
+    default void send(
+        String targetWorkerNodeId,
+        int partitionIndex,
+        byte[] data,
+        long sequenceNumber,
+        int producerAttempt,
+        long producerTaskId,
+        boolean isLast,
+        ActionListener<Void> listener
+    ) {
+        send(targetWorkerNodeId, partitionIndex, data, sequenceNumber, producerAttempt, isLast, listener);
+    }
+
+    /** Ships a block using the sender's task attempt and an explicit producer task identity. */
+    default void send(
+        String targetWorkerNodeId,
+        int partitionIndex,
+        byte[] data,
+        long sequenceNumber,
+        long producerTaskId,
+        boolean isLast,
+        ActionListener<Void> listener
+    ) {
+        send(targetWorkerNodeId, partitionIndex, data, sequenceNumber, 0, producerTaskId, isLast, listener);
+    }
 }

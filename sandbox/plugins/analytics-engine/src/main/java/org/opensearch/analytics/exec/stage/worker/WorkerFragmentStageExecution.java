@@ -26,9 +26,14 @@ import org.opensearch.analytics.spi.DataConsumer;
 import org.opensearch.analytics.spi.ExchangeSink;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.transport.TransportException;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiFunction;
 import java.util.function.Function;
 
 /**
@@ -45,10 +50,29 @@ import java.util.function.Function;
  */
 public class WorkerFragmentStageExecution extends AbstractStageExecution implements DataProducer, DataConsumer {
 
+    private static final int MAX_WORKER_TASK_RETRIES = 2;
+
     private final QueryContext config;
     private final ExchangeSink outputSink;
     private final ClusterService clusterService;
+    private final ConcurrentHashMap<StageTaskId, AtomicInteger> retryCounts = new ConcurrentHashMap<>();
 
+    public WorkerFragmentStageExecution(
+        Stage stage,
+        QueryContext config,
+        ExchangeSink outputSink,
+        ClusterService clusterService,
+        BiFunction<WorkerStageTask, WorkerExecutionTarget, WorkerFragmentRequest> requestBuilder,
+        AnalyticsSearchTransportService dispatcher
+    ) {
+        super(stage, config.queryId(), config.operationListeners(), config.parentTask());
+        this.config = config;
+        this.outputSink = outputSink;
+        this.clusterService = clusterService;
+        this.runner = new WorkerTaskRunner(this, config, dispatcher, requestBuilder);
+    }
+
+    /** Compatibility constructor for callers that do not yet stamp an attempt number. */
     public WorkerFragmentStageExecution(
         Stage stage,
         QueryContext config,
@@ -57,11 +81,33 @@ public class WorkerFragmentStageExecution extends AbstractStageExecution impleme
         Function<WorkerExecutionTarget, WorkerFragmentRequest> requestBuilder,
         AnalyticsSearchTransportService dispatcher
     ) {
-        super(stage, config.queryId(), config.operationListeners(), config.parentTask());
-        this.config = config;
-        this.outputSink = outputSink;
-        this.clusterService = clusterService;
-        this.runner = new WorkerTaskRunner(this, config, dispatcher, requestBuilder);
+        this(stage, config, outputSink, clusterService, (task, target) -> requestBuilder.apply(target), dispatcher);
+    }
+
+    /** Retries transport/liveness failures against the same worker while replayable shuffle blocks remain buffered. */
+    @Override
+    public Optional<StageTask> retargetForRetry(StageTask failed, Exception cause) {
+        if ((failed instanceof WorkerStageTask) == false || isRetryableWorkerFailure(cause) == false) {
+            return Optional.empty();
+        }
+        WorkerStageTask worker = (WorkerStageTask) failed;
+        AtomicInteger count = retryCounts.computeIfAbsent(worker.id(), ignored -> new AtomicInteger());
+        int next = count.incrementAndGet();
+        if (next > MAX_WORKER_TASK_RETRIES) {
+            return Optional.empty();
+        }
+        return Optional.of(worker.nextAttempt());
+    }
+
+    private static boolean isRetryableWorkerFailure(Throwable failure) {
+        for (Throwable current = failure; current != null; current = current.getCause()) {
+            if (current instanceof TransportException
+                || current instanceof java.io.IOException
+                || current instanceof java.util.concurrent.TimeoutException) {
+                return true;
+            }
+        }
+        return false;
     }
 
     @Override

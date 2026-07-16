@@ -973,7 +973,8 @@ public class DataFusionAnalyticsBackendPlugin implements AnalyticsSearchBackendP
                     targetWorkerNodeIds,
                     sender,
                     logTag,
-                    compression
+                    compression,
+                    context.taskId()
                 );
             }
         };
