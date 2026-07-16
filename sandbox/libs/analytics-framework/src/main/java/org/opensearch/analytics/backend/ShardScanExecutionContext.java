@@ -28,6 +28,9 @@ import org.opensearch.tasks.Task;
  */
 public class ShardScanExecutionContext implements CommonExecutionContext {
 
+    /** Default per-side idle timeout for a streaming hash-shuffle consumer. */
+    private static final long DEFAULT_SHUFFLE_RECEIVE_TIMEOUT_MILLIS = 60_000L;
+
     private final String tableName;
     private final Reader reader;
     private final Task task;
@@ -41,6 +44,7 @@ public class ShardScanExecutionContext implements CommonExecutionContext {
     private QueryCachingPolicy queryCachingPolicy;
     private ShardId shardId;
     private boolean hasPartialAggregate;
+    private volatile long shuffleReceiveTimeoutMillis = DEFAULT_SHUFFLE_RECEIVE_TIMEOUT_MILLIS;
 
     /**
      * Constructs an execution context.
@@ -171,5 +175,18 @@ public class ShardScanExecutionContext implements CommonExecutionContext {
 
     public void setHasPartialAggregate(boolean hasPartialAggregate) {
         this.hasPartialAggregate = hasPartialAggregate;
+    }
+
+    /** Returns the cluster-configured idle timeout used by hash-shuffle consumers. */
+    public long getShuffleReceiveTimeoutMillis() {
+        return shuffleReceiveTimeoutMillis;
+    }
+
+    /** Sets the idle timeout used by hash-shuffle consumers for this fragment. */
+    public void setShuffleReceiveTimeoutMillis(long timeoutMillis) {
+        if (timeoutMillis <= 0) {
+            throw new IllegalArgumentException("shuffle receive timeout must be positive");
+        }
+        this.shuffleReceiveTimeoutMillis = timeoutMillis;
     }
 }

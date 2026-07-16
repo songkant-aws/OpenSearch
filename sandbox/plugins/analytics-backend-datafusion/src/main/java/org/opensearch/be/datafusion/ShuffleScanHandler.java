@@ -55,21 +55,6 @@ public class ShuffleScanHandler implements FragmentInstructionHandler<ShuffleSca
 
     private static final Logger LOGGER = LogManager.getLogger(ShuffleScanHandler.class);
 
-    /** Cap on how long the consumer waits for a side's first chunk/EOF and for each subsequent
-     *  empty-queue interval while producers remain active. The cap exists solely as a backstop
-     *  against stuck producers (cancelled queries cascade through the
-     *  walker faster than this). Operator-tuneable via {@code analytics.mpp.shuffle.recv_timeout}
-     *  once that cluster setting is plumbed into {@link ShardScanExecutionContext}; today the
-     *  handler reads the JVM system property of the same name as a stopgap so integration
-     *  tests can dial it down without waiting on full SPI plumbing.
-     *
-     *  <p>5s default keeps test timelines tight while leaving headroom for slow CI hosts.
-     *  Real shuffle producers are far faster — a single batch RTT over local transport is
-     *  microseconds. */
-    private static final long DEFAULT_AWAIT_READY_TIMEOUT_MS = Long.parseLong(
-        System.getProperty("analytics.mpp.shuffle.recv_timeout_ms", "5000")
-    );
-
     @Override
     public BackendExecutionContext apply(
         ShuffleScanInstructionNode node,
@@ -112,6 +97,7 @@ public class ShuffleScanHandler implements FragmentInstructionHandler<ShuffleSca
         }
 
         ShuffleBufferAccess buffer = registry.getOrCreate(node.getQueryId(), node.getTargetStageId(), node.getShufflePartitionIndex());
+        long receiveTimeoutMillis = shardCtx.getShuffleReceiveTimeoutMillis();
         // expectedSenders for both sides are set eagerly by the ShuffleWorkerSetupHandler
         // (which runs before any ShuffleScanHandler) so the buffer knows BOTH sides' counts
         // before either side's awaitReady call blocks. Setting them per-side here would
@@ -128,12 +114,12 @@ public class ShuffleScanHandler implements FragmentInstructionHandler<ShuffleSca
             );
             // Wait only for this side's first chunk or EOF. The live iterator below continues to
             // wait for later chunks, so DataFusion can build/consume while transport is in flight.
-            if (!buffer.awaitReadable(side, DEFAULT_AWAIT_READY_TIMEOUT_MS)) {
+            if (!buffer.awaitReadable(side, receiveTimeoutMillis)) {
                 throw new RuntimeException(
                     "ShuffleScanHandler: timed out waiting for shuffle input to become readable for "
                         + inputId
                         + " (timeout="
-                        + DEFAULT_AWAIT_READY_TIMEOUT_MS
+                        + receiveTimeoutMillis
                         + "ms)"
                 );
             }
@@ -145,9 +131,7 @@ public class ShuffleScanHandler implements FragmentInstructionHandler<ShuffleSca
         // LAZY drain: pull chunks one at a time. With spill, only ONE chunk is heap-resident at a
         // time — the rest stream from the spill file — so an over-budget partition drains without
         // re-materializing (the whole point of disk spill). The iterator owns the spill-file handle.
-        CloseableIterator<byte[]> chunks = isLeftSide
-            ? buffer.streamLeft(DEFAULT_AWAIT_READY_TIMEOUT_MS)
-            : buffer.streamRight(DEFAULT_AWAIT_READY_TIMEOUT_MS);
+        CloseableIterator<byte[]> chunks = isLeftSide ? buffer.streamLeft(receiveTimeoutMillis) : buffer.streamRight(receiveTimeoutMillis);
 
         // Peek the first chunk for the schema (one chunk in heap is fine). No first chunk → empty
         // partition: register an empty memtable and return. Close the iterator on every path here.

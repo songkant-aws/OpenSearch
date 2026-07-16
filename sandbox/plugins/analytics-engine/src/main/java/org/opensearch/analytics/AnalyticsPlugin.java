@@ -201,6 +201,9 @@ public class AnalyticsPlugin extends Plugin implements ExtensiblePlugin, ActionP
             readerContextStore
         );
         searchService.setShuffleBufferRegistry(shuffleBufferManager);
+        applyShuffleReceiveTimeout(clusterService.getClusterSettings().get(AnalyticsSettings.MPP_SHUFFLE_RECV_TIMEOUT).millis());
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(AnalyticsSettings.MPP_SHUFFLE_RECV_TIMEOUT, value -> applyShuffleReceiveTimeout(value.millis()));
         // Wire the node-level shuffle budget from settings (initial value + dynamic updates). The
         // budget is a percent of max heap; node budget == per-query max (a lone query may use the
         // whole budget, but no single query may exceed it — that fails fast, non-retryably). Without
@@ -245,6 +248,13 @@ public class AnalyticsPlugin extends Plugin implements ExtensiblePlugin, ActionP
             analyticsSearchSlowLog,
             statsCollector
         );
+    }
+
+    private void applyShuffleReceiveTimeout(long timeoutMillis) {
+        if (searchService != null) {
+            searchService.setShuffleReceiveTimeoutMillis(timeoutMillis);
+        }
+        logger.info("[analytics] hash-shuffle receive timeout set to {}ms", timeoutMillis);
     }
 
     /**

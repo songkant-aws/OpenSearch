@@ -94,6 +94,7 @@ public class AnalyticsSearchService implements AutoCloseable {
     private org.opensearch.transport.client.Client client;
     private org.opensearch.threadpool.ThreadPool threadPool;
     private org.opensearch.cluster.service.ClusterService clusterService;
+    private volatile long shuffleReceiveTimeoutMillis = 60_000L;
     private final BufferAllocator allocator;
     private final ArrowNativeAllocator nativeAllocator;
 
@@ -151,6 +152,14 @@ public class AnalyticsSearchService implements AutoCloseable {
      */
     public void setShuffleBufferRegistry(ShuffleBufferRegistry registry) {
         this.shuffleBufferRegistry = registry;
+    }
+
+    /** Updates the per-side idle timeout passed to worker shuffle scan contexts. */
+    public void setShuffleReceiveTimeoutMillis(long timeoutMillis) {
+        if (timeoutMillis <= 0) {
+            throw new IllegalArgumentException("shuffle receive timeout must be positive");
+        }
+        this.shuffleReceiveTimeoutMillis = timeoutMillis;
     }
 
     /**
@@ -455,6 +464,7 @@ public class AnalyticsSearchService implements AutoCloseable {
                     ctx.setAllocator(allocator);
                     ctx.setNamedWriteableRegistry(namedWriteableRegistry);
                     ctx.setShuffleBufferRegistry(shuffleBufferRegistry);
+                    ctx.setShuffleReceiveTimeoutMillis(shuffleReceiveTimeoutMillis);
 
                     List<InstructionNode> instructions = plan.getInstructions();
                     if (!instructions.isEmpty()) {
@@ -1032,6 +1042,7 @@ public class AnalyticsSearchService implements AutoCloseable {
         ctx.setIndexSettings(shard.indexSettings());
         ctx.setNamedWriteableRegistry(namedWriteableRegistry);
         ctx.setShuffleBufferRegistry(shuffleBufferRegistry);
+        ctx.setShuffleReceiveTimeoutMillis(shuffleReceiveTimeoutMillis);
         ctx.setQueryCache(shard.getQueryCache());
         ctx.setQueryCachingPolicy(shard.getQueryCachingPolicy());
         ctx.setShardId(shard.shardId());

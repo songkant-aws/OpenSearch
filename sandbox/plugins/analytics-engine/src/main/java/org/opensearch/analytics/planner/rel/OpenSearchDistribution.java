@@ -44,8 +44,8 @@ import java.util.Objects;
  * <p><b>Satisfies semantics.</b> For {@code SINGLETON}, the same locality satisfies; a
  * SINGLETON demand with null locality accepts either SHARD or COORDINATOR (used by callers
  * that don't care whether data is shard-local or gathered). For {@code HASH_DISTRIBUTED},
- * the produced trait satisfies the demand iff the keys are a superset of the demanded keys
- * (finer satisfies coarser) AND the partition counts match exactly.
+ * the produced trait satisfies the demand iff the key lists match exactly and the partition
+ * counts match exactly.
  *
  * @opensearch.internal
  */
@@ -146,10 +146,10 @@ public class OpenSearchDistribution implements RelDistribution {
             return this.locality == other.locality;
         }
         if (this.type == Type.HASH_DISTRIBUTED) {
-            // A hash partitioning on keys K is also a hash partitioning on any prefix of K
-            // (rows colocated by hash(k1,k2) are also colocated by hash(k1) — finer satisfies
-            // coarser). Demanded keys must therefore be a prefix of produced keys.
-            if (!isPrefix(other.keys, this.keys)) return false;
+            // Hash(k1,k2) does not colocate equal k1 values: k2 still contributes to the hash.
+            // Only the exact key list is a safe co-location contract. A prefix relation here
+            // could make a parent skip a required repartition and produce incorrect grouping.
+            if (!this.keys.equals(other.keys)) return false;
             // Partition counts must match exactly: HASH(k, 4) and HASH(k, 8) place rows in
             // entirely different buckets, so neither satisfies the other regardless of keys.
             // A null demanded partitionCount accepts any (used while the rule is still
@@ -171,15 +171,6 @@ public class OpenSearchDistribution implements RelDistribution {
             return this.locality == other.locality;
         }
         return this.keys.equals(other.keys);
-    }
-
-    /** Returns true iff {@code prefix} is a prefix of {@code list}. */
-    private static boolean isPrefix(List<Integer> prefix, List<Integer> list) {
-        if (prefix.size() > list.size()) return false;
-        for (int i = 0; i < prefix.size(); i++) {
-            if (!Objects.equals(prefix.get(i), list.get(i))) return false;
-        }
-        return true;
     }
 
     @Override

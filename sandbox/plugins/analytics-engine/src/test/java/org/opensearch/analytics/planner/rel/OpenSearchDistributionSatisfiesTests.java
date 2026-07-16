@@ -65,17 +65,16 @@ public class OpenSearchDistributionSatisfiesTests extends OpenSearchTestCase {
         assertTrue(h.satisfies(h));
     }
 
-    public void testFinerHashSatisfiesCoarserHash() {
-        // HASH(k1, k2) satisfies HASH(k1) — rows colocated by hash(k1, k2) are also colocated
-        // by hash(k1). Demanded keys must be a prefix of produced keys.
+    public void testHashWithDifferentKeyListsDoNotSatisfy() {
+        // HASH(k1, k2) does not colocate equal k1 values: k2 still contributes to the hash.
+        // The planner must insert a re-shuffle when the exact key list changes.
         OpenSearchDistribution finer = traitDef.hash(List.of(0, 1), 4);
         OpenSearchDistribution coarser = traitDef.hash(List.of(0), 4);
-        assertTrue(finer.satisfies(coarser));
+        assertFalse(finer.satisfies(coarser));
     }
 
     public void testCoarserHashDoesNotSatisfyFinerHash() {
-        // HASH(k1) does NOT satisfy HASH(k1, k2) — partitioning by k1 alone doesn't colocate
-        // rows by k2.
+        // HASH(k1) does not satisfy HASH(k1, k2) either.
         OpenSearchDistribution coarser = traitDef.hash(List.of(0), 4);
         OpenSearchDistribution finer = traitDef.hash(List.of(0, 1), 4);
         assertFalse(coarser.satisfies(finer));

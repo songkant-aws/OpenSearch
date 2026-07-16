@@ -819,6 +819,50 @@ public class ShuffleBufferManagerTests extends OpenSearchTestCase {
         assertEquals(0L, mgr.getQueryBytes("q1"));
     }
 
+    /** A live drain only protects its own side. The other side may still be moved to disk when the
+     * node budget is full; rejecting that spill would make pipelining and spill mutually exclusive. */
+    public void testLiveDrainCanSpillTheOtherSide() throws Exception {
+        Path spillDir = createTempDir();
+        ShuffleBufferManager mgr = new ShuffleBufferManager();
+        mgr.setBudgets(100, 100);
+        mgr.setSpillConfig(true, spillDir, 1_000_000);
+        ShuffleBufferManager.ShuffleBuffer buffer = mgr.getOrCreateBuffer("q1", 0, 0);
+        buffer.setExpectedSenders(1, 1);
+
+        mgr.tryAdmit("q1", 0, 0, "left", chunk(0, 50));
+        mgr.tryAdmit("q1", 0, 0, "right", chunk(1, 50));
+        try (var left = buffer.streamLeft(1_000)) {
+            assertEquals(
+                "the non-streaming right side can be spilled while left is live",
+                AdmitResult.ACCEPTED,
+                mgr.tryAdmit("q1", 0, 0, "left", chunk(2, 40))
+            );
+            assertTrue("right-side spill should free admission room", mgr.getSpilledTotalBytes() > 0);
+            assertEquals((byte) 0, left.next()[0]);
+            buffer.senderDone("left");
+            assertEquals((byte) 2, left.next()[0]);
+            assertFalse(left.hasNext());
+        }
+        buffer.senderDone("right");
+        assertEquals("the spilled right row remains available", 1, buffer.getRightData().size());
+        mgr.clearForQuery("q1");
+
+        // A producer may still be sending the opposite side after the live consumer starts. That
+        // side has not been snapshotted, so it must be admitted and may spill its own resident tail.
+        ShuffleBufferManager.ShuffleBuffer opposite = mgr.getOrCreateBuffer("q2", 0, 0);
+        opposite.setExpectedSenders(1, 1);
+        mgr.tryAdmit("q2", 0, 0, "left", chunk(0, 50));
+        mgr.tryAdmit("q2", 0, 0, "right", chunk(1, 20));
+        try (var left = opposite.streamLeft(1_000)) {
+            assertEquals(AdmitResult.ACCEPTED, mgr.tryAdmit("q2", 0, 0, "right", chunk(2, 40)));
+            assertEquals((byte) 0, left.next()[0]);
+        }
+        opposite.senderDone("left");
+        opposite.senderDone("right");
+        assertEquals("late opposite-side data remains available", 2, opposite.getRightData().size());
+        mgr.clearForQuery("q2");
+    }
+
     public void testSpilledPrefixTransitionsToLiveBackpressuredQueue() throws Exception {
         Path spillDir = createTempDir();
         ShuffleBufferManager mgr = new ShuffleBufferManager();

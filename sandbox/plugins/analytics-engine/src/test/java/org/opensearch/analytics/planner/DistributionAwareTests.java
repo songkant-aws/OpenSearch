@@ -106,6 +106,18 @@ public class DistributionAwareTests extends BasePlannerRulesTests {
         assertEquals(Integer.valueOf(N), out.getPartitionCount());
     }
 
+    public void testJoin_doesNotDeriveHashOutputForRightOrFullOuterJoin() {
+        for (JoinRelType type : List.of(JoinRelType.RIGHT, JoinRelType.FULL)) {
+            OpenSearchJoin join = equiJoin(type, 0, 0);
+            OpenSearchDistribution leftActual = traitDef.hash(List.of(0), N);
+            OpenSearchDistribution rightActual = traitDef.hash(List.of(0), N);
+            assertNull(
+                type + " outer join has null-extended left rows",
+                join.deriveOutputDistribution(List.of(leftActual, rightActual), traitDef)
+            );
+        }
+    }
+
     public void testJoin_noDerivedOutputWhenLeftKeyMismatch() {
         OpenSearchJoin join = equiJoin(JoinRelType.INNER, 0, 0);
         // Left actually hashed on a DIFFERENT key than the join's left equi key → output not co-partitionable.

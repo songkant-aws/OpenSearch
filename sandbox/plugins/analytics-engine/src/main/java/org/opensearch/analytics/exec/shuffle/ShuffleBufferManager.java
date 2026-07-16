@@ -317,11 +317,12 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
                     "Shuffle data arrived after completed " + side + " stream for " + key(queryId, targetStageId, partitionIndex)
                 );
             }
-            // A sealed/snapshot drain cannot accept late data because its tail has already been
-            // copied. A live streaming drain deliberately can: addData wakes the blocking iterator,
-            // which removes and budget-releases each chunk as it is consumed. Both modes are ordered
-            // against this check by admitLock.
-            if (buffer.isDraining() && buffer.isStreaming(side) == false) {
+            // A side whose snapshot drain has started cannot accept late data because its tail has
+            // already been copied. A live streaming drain deliberately can: addData wakes the
+            // blocking iterator, which removes and budget-releases each chunk as it is consumed.
+            // The opposite side remains admissible until its own consumer starts; all transitions
+            // are ordered against this check by admitLock.
+            if (buffer.isSideDraining(side) && buffer.isStreaming(side) == false) {
                 buffer.recordRejected();
                 throw new IllegalStateException(
                     "Shuffle data ("
@@ -330,7 +331,7 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
                         + key(queryId, targetStageId, partitionIndex)
                         + " side="
                         + side
-                        + " — the consumer already snapshotted this partition, so the chunk would be lost. "
+                        + " — the consumer already snapshotted this side, so the chunk would be lost. "
                         + "This indicates a producer shipped data after its isLast (a close-ordering bug)."
                 );
             }
@@ -413,20 +414,16 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
      * spill is enabled).
      */
     private long spillToMakeRoom(ShuffleBuffer buffer, String queryId, int targetStageId, String side, long targetBytes) {
-        // NEVER spill a buffer a consumer has begun draining: its drain may have already snapshotted the
-        // in-memory tail or opened the spill file for read, so mutating its lists/spill file here would
-        // drop/duplicate rows or NPE in SpilledSide.append. `draining` is flipped under admitLock
-        // (beginDrain), which we hold here, so these reads can't race a half-started drain. A draining
-        // buffer also no longer accepts evictions, so it simply contributes nothing to `freed`. (codex
-        // review round-4 BLOCKER #1: cross-partition spill could race a draining sibling.)
+        // A snapshot drain cannot be modified after it starts: its tail may already have been copied
+        // and its spill file may be open for read. A LIVE drain is different — its queue removes and
+        // accounts chunks one at a time, so an unrelated side of the same buffer can still be spilled.
+        // spillBufferBothSides applies this per-side rule while admitLock orders it with beginDrain.
         long freed = 0L;
         // 1. Spill the RECEIVING buffer first — its incoming-side chunks, then its other side. Each
         // spillOldest releases the spilled bytes from THAT buffer's own currentBytes so removeBuffer
-        // later releases only what's still resident (no double-release). (A receiving buffer that is
-        // already draining — a retried/reordered admit landing post-drain — is skipped here too.)
-        if (!buffer.isDraining()) {
-            freed += spillBufferBothSides(buffer, side, targetBytes);
-        }
+        // later releases only what's still resident (no double-release). Snapshot-draining buffers
+        // contribute nothing; a live-draining buffer may contribute only its non-streaming side.
+        freed += spillBufferBothSides(buffer, side, targetBytes);
         if (freed >= targetBytes) {
             return freed;
         }
@@ -441,7 +438,7 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
                 break;
             }
             ShuffleBuffer sibling = e.getValue();
-            if (sibling == buffer || sibling.isDraining() || !e.getKey().startsWith(stagePrefix)) {
+            if (sibling == buffer || !e.getKey().startsWith(stagePrefix) || !sibling.hasSpillableSide()) {
                 continue;
             }
             freed += spillBufferBothSides(sibling, side, targetBytes - freed);
@@ -457,10 +454,15 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
      * cross-side interleaving is irrelevant). MUST run under {@link #admitLock}.
      */
     private long spillBufferBothSides(ShuffleBuffer buffer, String side, long targetBytes) {
-        long freed = buffer.spillOldest(side, targetBytes);
+        long freed = 0L;
+        if (buffer.canSpillSide(side)) {
+            freed += buffer.spillOldest(side, targetBytes);
+        }
         if (freed < targetBytes) {
             String other = "left".equals(side) ? "right" : "left";
-            freed += buffer.spillOldest(other, targetBytes - freed);
+            if (buffer.canSpillSide(other)) {
+                freed += buffer.spillOldest(other, targetBytes - freed);
+            }
         }
         buffer.releaseCurrentBytes(freed);
         return freed;
@@ -815,15 +817,17 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
         private SpilledSide rightSpill;
 
         /**
-         * Set once a consumer begins draining this buffer (snapshotting the in-memory tail / opening
-         * the spill file for read). Flipped under the manager's {@code admitLock} BEFORE the drain
-         * touches any list/file, so {@code spillToMakeRoom} — which also runs under {@code admitLock} —
-         * never spills a buffer that is concurrently draining. Without this, a late cross-partition
-         * admit could spill a sibling whose drain iterator has already snapshotted its tail or closed
-         * its append stream, dropping/duplicating rows or NPEing in {@code SpilledSide.append}.
-         * (codex review round-4 BLOCKER #1.) volatile so the spill path sees a set made under the lock.
+         * Set once a consumer begins draining this buffer. Snapshot drains remain immutable after
+         * this point; a live drain protects only its active side, while the opposite side may still
+         * be spilled because its consumer has not established an arrival-order snapshot. Flipped
+         * under the manager's {@code admitLock} BEFORE the drain touches any list/file, so the
+         * per-side spill decision and drain startup are ordered. Volatile so the spill path sees a
+         * value published under the lock.
          */
         private volatile boolean draining;
+        /** Per-side drain state: only the side whose consumer has started a snapshot is sealed. */
+        private volatile boolean leftDraining;
+        private volatile boolean rightDraining;
         /** Per-side live-drain state: one side must never make a sibling snapshot drain appendable. */
         private volatile boolean leftStreaming;
         private volatile boolean rightStreaming;
@@ -1135,22 +1139,31 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
         }
 
         /**
-         * Marks this buffer as draining so the spill path stops touching it. Flips {@link #draining}
-         * under the owner's {@code admitLock} (when an owner is wired) so the set is ordered against
-         * {@code spillToMakeRoom}: once this returns, no concurrent or subsequent spill will evict from
-         * this buffer (the sibling-spill loop skips {@code draining} buffers). Called at the head of
-         * every drain entry point, BEFORE any list snapshot or spill-file open. A throwaway buffer
-         * (no owner) just sets the flag. (codex review round-4 BLOCKER #1.)
+         * Marks this buffer as draining. Flips {@link #draining} under the owner's
+         * {@code admitLock} (when an owner is wired), ordering drain startup with the per-side spill
+         * decision in {@code spillToMakeRoom}. Snapshot drains protect both sides; live drains protect
+         * only the side being streamed. Called at the head of every drain entry point, BEFORE any list
+         * snapshot or spill-file open. A throwaway buffer (no owner) just sets the flag.
          */
         private void beginDrain(String side, boolean live) {
             if (owner != null) {
                 synchronized (owner.admitLock) {
                     draining = true;
+                    markDraining(side);
                     markStreaming(side, live);
                 }
             } else {
                 draining = true;
+                markDraining(side);
                 markStreaming(side, live);
+            }
+        }
+
+        private void markDraining(String side) {
+            if ("left".equals(side)) {
+                leftDraining = true;
+            } else {
+                rightDraining = true;
             }
         }
 
@@ -1172,6 +1185,25 @@ public class ShuffleBufferManager implements ShuffleBufferRegistry {
 
         boolean isStreaming(String side) {
             return "left".equals(side) ? leftStreaming : rightStreaming;
+        }
+
+        private boolean isSideDraining(String side) {
+            return "left".equals(side) ? leftDraining : rightDraining;
+        }
+
+        /** Whether spilling this side is safe after a consumer has started. */
+        private boolean canSpillSide(String side) {
+            if (draining == false) {
+                return true;
+            }
+            // A side that has not started draining remains append-only and can be moved to disk.
+            // Once its own snapshot/live drain starts, its arrival order is sealed; the live side
+            // must remain in memory while the not-yet-started side can still spill.
+            return isSideDraining(side) == false;
+        }
+
+        private boolean hasSpillableSide() {
+            return canSpillSide("left") || canSpillSide("right");
         }
 
         boolean isStreamFinished(String side) {

@@ -16,7 +16,7 @@
 //! query memory pool says that continuing in memory is unsafe.
 //!
 //! The spill path writes the build input once, hash-partitions both sides with
-//! DataFusion's own `BatchPartitioner`, and executes one ordinary
+//! DataFusion's hash evaluator and an independent Grace seed, and executes one ordinary
 //! `HashJoinExec` per disk-backed bucket. Therefore the row-to-bucket mapping is
 //! identical on both sides and each bucket releases its hash table before the
 //! next one starts.
@@ -24,7 +24,10 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use datafusion::arrow::array::UInt32Array;
+use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{DataFusionError, Result};
@@ -32,13 +35,13 @@ use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::execution::disk_manager::RefCountedTempFile;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryLimit};
 use datafusion::execution::TaskContext;
+use datafusion::physical_expr_common::utils::evaluate_expressions_to_arrays;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SeededRandomState};
 use datafusion::physical_plan::limit::LimitStream;
 use datafusion::physical_plan::metrics::{
-    BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, SpillMetrics,
+    BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, SpillMetrics, Time,
 };
-use datafusion::physical_plan::repartition::BatchPartitioner;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
 use datafusion::physical_plan::{
@@ -57,6 +60,11 @@ const DEFAULT_BUILD_TARGET_BYTES: usize = 512 * 1024 * 1024;
 /// too large because of extreme key skew is still protected by DataFusion's
 /// memory reservation and fails with a resource error rather than an OOM.
 const MAX_SPILL_BUCKETS: usize = 256;
+/// Seed used only for the local Grace repartition. The upstream MPP exchange uses
+/// DataFusion's `REPARTITION_RANDOM_STATE` (seed 0); reusing it here can collapse all
+/// rows into one bucket when the exchange partition count is a power of two.
+/// Keep this separate from both the exchange and HashJoinExec seeds.
+const GRACE_HASH_SEED: SeededRandomState = SeededRandomState::with_seed(0x5f37_59df_4a7c_15e9);
 
 /// Installs [`SpillableHashJoinExec`] around partitioned hash joins.
 #[derive(Debug)]
@@ -106,6 +114,22 @@ struct SpillableHashJoinExec {
 
 impl SpillableHashJoinExec {
     fn new(original: &HashJoinExec) -> Self {
+        // A Grace join emits buckets serially, so it cannot preserve a child's ordering even
+        // when the wrapped HashJoinExec advertises one. Keep the partitioning and execution
+        // characteristics, but rebuild equivalence properties from the output schema to clear
+        // output_ordering. Otherwise a parent Sort/TopK may silently skip a required sort.
+        let schema = original.schema();
+        let input_properties = original.properties();
+        let properties = Arc::new(
+            PlanProperties::new(
+                datafusion::physical_expr::EquivalenceProperties::new(Arc::clone(&schema)),
+                input_properties.output_partitioning().clone(),
+                input_properties.emission_type,
+                input_properties.boundedness,
+            )
+            .with_evaluation_type(input_properties.evaluation_type)
+            .with_scheduling_type(input_properties.scheduling_type),
+        );
         Self {
             original: Arc::new(
                 original
@@ -114,7 +138,7 @@ impl SpillableHashJoinExec {
                     .build()
                     .expect("an existing HashJoinExec must rebuild"),
             ),
-            properties: Arc::clone(original.properties()),
+            properties,
             metrics: ExecutionPlanMetricsSet::new(),
             build_target_override: None,
         }
@@ -193,7 +217,8 @@ impl SpillableHashJoinExec {
             let probe_stream = original.right().execute(partition, Arc::clone(&context))?;
             let probe = one_shot_exec(original.right().schema(), probe_stream)?;
             let join = rebuild_bucket_join(&original, build, probe)?;
-            return join.execute(0, context);
+            let joined = join.execute(0, Arc::clone(&context))?;
+            return apply_fetch(original.fetch(), joined, &metrics, partition);
         }
 
         spill_trigger_count.add(1);
@@ -261,6 +286,7 @@ impl SpillableHashJoinExec {
             partition,
             &metrics,
             "spillable hash join build bucket",
+            GRACE_HASH_SEED,
         )
         .await?;
 
@@ -273,6 +299,7 @@ impl SpillableHashJoinExec {
             partition,
             &metrics,
             "spillable hash join probe bucket",
+            GRACE_HASH_SEED,
         )
         .await?;
 
@@ -510,6 +537,7 @@ async fn partition_spill_file(
     input_partition: usize,
     metrics: &ExecutionPlanMetricsSet,
     description: &str,
+    hash_seed: SeededRandomState,
 ) -> Result<Vec<Option<RefCountedTempFile>>> {
     let stream = manager.read_spill_as_stream(file, None)?;
     partition_stream_to_files(
@@ -520,6 +548,7 @@ async fn partition_spill_file(
         input_partition,
         metrics,
         description,
+        hash_seed,
     )
     .await
 }
@@ -532,24 +561,94 @@ async fn partition_stream_to_files(
     input_partition: usize,
     metrics: &ExecutionPlanMetricsSet,
     description: &str,
+    hash_seed: SeededRandomState,
 ) -> Result<Vec<Option<RefCountedTempFile>>> {
     let timer = MetricBuilder::new(metrics).subset_time("spill_partition_time", input_partition);
-    let mut partitioner = BatchPartitioner::new_hash_partitioner(keys, bucket_count, timer)?;
-    let mut writers = (0..bucket_count)
-        .map(|bucket| manager.create_in_progress_file(&format!("{description} {bucket}")))
-        .collect::<Result<Vec<_>>>()?;
+    let mut writers = (0..bucket_count).map(|_| None).collect::<Vec<_>>();
 
     while let Some(batch) = input.next().await {
-        partitioner.partition(batch?, |bucket, batch| {
-            writers[bucket].append_batch(&batch)?;
-            Ok(())
-        })?;
+        partition_batch_with_seed(
+            &batch?,
+            &keys,
+            bucket_count,
+            &hash_seed,
+            &timer,
+            |bucket, batch| {
+                if writers[bucket].is_none() {
+                    writers[bucket] =
+                        Some(manager.create_in_progress_file(&format!("{description} {bucket}"))?);
+                }
+                writers[bucket]
+                    .as_mut()
+                    .expect("writer was initialized above")
+                    .append_batch(&batch)?;
+                Ok(())
+            },
+        )?;
     }
 
     writers
         .into_iter()
-        .map(|mut writer| writer.finish())
+        .map(|writer| match writer {
+            Some(mut writer) => writer.finish(),
+            None => Ok(None),
+        })
         .collect()
+}
+
+/// Hash-partitions one batch with a seed that is independent from the upstream exchange.
+/// DataFusion's `BatchPartitioner` intentionally fixes the repartition seed at zero, so the
+/// Grace path performs the same grouped take locally while supplying its own seed.
+fn partition_batch_with_seed<F>(
+    batch: &RecordBatch,
+    keys: &[Arc<dyn datafusion::physical_expr::PhysicalExpr>],
+    bucket_count: usize,
+    hash_seed: &SeededRandomState,
+    timer: &Time,
+    mut emit: F,
+) -> Result<()>
+where
+    F: FnMut(usize, RecordBatch) -> Result<()>,
+{
+    let _timer = timer.timer();
+    let arrays = evaluate_expressions_to_arrays(keys, batch)?;
+    let mut hashes = vec![0u64; batch.num_rows()];
+    datafusion::common::hash_utils::create_hashes(&arrays, hash_seed.random_state(), &mut hashes)?;
+    let mut indices = vec![Vec::<u32>::new(); bucket_count];
+    for (row, hash) in hashes.into_iter().enumerate() {
+        indices[(hash % bucket_count as u64) as usize].push(row as u32);
+    }
+    for (bucket, rows) in indices.into_iter().enumerate() {
+        if rows.is_empty() {
+            continue;
+        }
+        let row_indices = UInt32Array::from(rows);
+        let columns = batch
+            .columns()
+            .iter()
+            .map(|column| take(column.as_ref(), &row_indices, None))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| DataFusionError::ArrowError(Box::new(error), None))?;
+        emit(bucket, RecordBatch::try_new(batch.schema(), columns)?)?;
+    }
+    Ok(())
+}
+
+fn apply_fetch(
+    fetch: Option<usize>,
+    stream: SendableRecordBatchStream,
+    metrics: &ExecutionPlanMetricsSet,
+    partition: usize,
+) -> Result<SendableRecordBatchStream> {
+    match fetch {
+        Some(fetch) => Ok(Box::pin(LimitStream::new(
+            stream,
+            0,
+            Some(fetch),
+            BaselineMetrics::new(metrics, partition),
+        ))),
+        None => Ok(stream),
+    }
 }
 
 #[cfg(test)]
@@ -561,6 +660,20 @@ mod tests {
     use datafusion::common::NullEquality;
     use datafusion::logical_expr::JoinType;
     use datafusion::physical_expr::expressions::Column;
+
+    #[test]
+    fn grace_partition_uses_an_independent_seed() {
+        assert_ne!(
+            GRACE_HASH_SEED.seed(),
+            0,
+            "Grace repartition must not reuse exchange seed"
+        );
+        assert_ne!(
+            GRACE_HASH_SEED.seed(),
+            12210250226015887276u64,
+            "Grace repartition must not reuse HashJoinExec seed"
+        );
+    }
 
     fn input(
         schema: SchemaRef,

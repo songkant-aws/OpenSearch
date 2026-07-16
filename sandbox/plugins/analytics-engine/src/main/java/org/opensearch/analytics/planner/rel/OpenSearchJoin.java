@@ -352,6 +352,13 @@ public class OpenSearchJoin extends Join implements OpenSearchRelNode, Distribut
                 // longer consulted and ShuffleEnrichment supplies the compatibility fallback.
                 return planner.getCostFactory().makeInfiniteCost();
             } else if (joinAlgorithm == JoinAlgorithm.HASH) {
+                // A hash join is only memory-safe when both build-side estimates are known and
+                // finite. Treat missing/NaN stats as unsafe instead of letting the comparisons
+                // below silently pass (NaN >= limit is false), which would turn an unknown build
+                // into an optimistic HJ choice and defer the failure to execution.
+                if (Double.isFinite(estimatedBuildRows) == false || Double.isFinite(estimatedBuildBytesPerWorker) == false) {
+                    return planner.getCostFactory().makeInfiniteCost();
+                }
                 boolean rowLimitExceeded = hashJoinMaxBuildRows >= 0 && estimatedBuildRows >= hashJoinMaxBuildRows;
                 boolean byteLimitExceeded = hashJoinMaxBytesPerWorker > 0 && estimatedBuildBytesPerWorker > hashJoinMaxBytesPerWorker;
                 if (rowLimitExceeded || byteLimitExceeded) {
@@ -423,6 +430,12 @@ public class OpenSearchJoin extends Join implements OpenSearchRelNode, Distribut
         }
         OpenSearchDistribution leftDist = childDistributions.get(0);
         if (leftDist == null || leftDist.getType() != org.apache.calcite.rel.RelDistribution.Type.HASH_DISTRIBUTED) {
+            return null;
+        }
+        // RIGHT/FULL joins add rows whose left side is null. Those rows have no left hash key,
+        // so advertising WORKER+HASH(leftKeys) would let a parent keyed aggregate skip an
+        // exchange and silently split the null-extension rows from the real key groups.
+        if (getJoinType() == JoinRelType.RIGHT || getJoinType() == JoinRelType.FULL) {
             return null;
         }
         JoinInfo info = analyzeCondition();

@@ -118,6 +118,19 @@ public class OpenSearchJoinCostTests extends BasePlannerRulesTests {
         assertTrue("non-spillable HJ must be rejected when its per-worker hash table exceeds budget", costOf(hashJoin).isInfinite());
     }
 
+    public void testHashJoinWithUnknownBuildStatsIsIneligible() {
+        OpenSearchDistribution hash = traitDef.hash(List.of(0), 4);
+        OpenSearchJoin hashJoin = makeJoin(scanWith(hash), scanWith(hash), hash).withJoinAlgorithm(
+            OpenSearchJoin.JoinAlgorithm.HASH,
+            Double.NaN,
+            Double.NaN,
+            20_000_000L,
+            512L * 1024 * 1024
+        );
+
+        assertTrue("unknown build statistics must not optimistically select HJ", costOf(hashJoin).isInfinite());
+    }
+
     private OpenSearchTableScan scanWith(OpenSearchDistribution distribution) {
         RelTraitSet traits = RelTraitSet.createEmpty().plus(OpenSearchConvention.INSTANCE).plus(distribution);
         return new OpenSearchTableScan(volcanoCluster, traits, testTable, List.of("mock-parquet"), List.<FieldStorageInfo>of());
