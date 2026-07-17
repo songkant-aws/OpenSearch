@@ -132,6 +132,58 @@ public final class OpenSearchRelMetadataQuery extends RelMetadataQuery {
         return total;
     }
 
+    /**
+     * Shared memory estimate for a partitioned hash-join build. Both the Volcano HJ/SMJ
+     * alternatives and the post-CBO enforcement fallback must use this calculation; otherwise a
+     * cascaded join can bypass the byte gate and revert to the old scan-row heuristic.
+     */
+    public static HashBuildEstimate estimateHashBuild(RelMetadataQuery mq, RelNode buildSide, int partitionCount, boolean statisticsKnown) {
+        if (statisticsKnown == false || buildSide == null || partitionCount <= 0) {
+            return HashBuildEstimate.UNKNOWN;
+        }
+        Double rowsValue = mq.getRowCount(buildSide);
+        double rows = rowsValue == null ? Double.NaN : rowsValue;
+        if (Double.isFinite(rows) == false || rows < 0d) {
+            return HashBuildEstimate.UNKNOWN;
+        }
+        Double metadataWidth = mq.getAverageRowSize(buildSide);
+        double rowWidth = metadataWidth == null || Double.isFinite(metadataWidth) == false || metadataWidth <= 0d
+            ? estimateRowWidthBytes(buildSide.getRowType())
+            : metadataWidth;
+        if (Double.isFinite(rowWidth) == false || rowWidth <= 0d) {
+            return HashBuildEstimate.UNKNOWN;
+        }
+        return estimateHashBuild(rows, rowWidth, partitionCount, true);
+    }
+
+    /** Numeric form kept separate so the budget arithmetic is directly testable. */
+    static HashBuildEstimate estimateHashBuild(double rows, double rowWidth, int partitionCount, boolean statisticsKnown) {
+        if (statisticsKnown == false
+            || partitionCount <= 0
+            || Double.isFinite(rows) == false
+            || rows < 0d
+            || Double.isFinite(rowWidth) == false
+            || rowWidth <= 0d) {
+            return HashBuildEstimate.UNKNOWN;
+        }
+        return new HashBuildEstimate(rows, rowWidth, rows * rowWidth * 1.5d / partitionCount);
+    }
+
+    /** Build rows, projection-aware row width and per-worker HJ working-set estimate. */
+    public record HashBuildEstimate(double rows, double rowWidthBytes, double bytesPerWorker) {
+        public static final HashBuildEstimate UNKNOWN = new HashBuildEstimate(Double.NaN, Double.NaN, Double.NaN);
+
+        /** Unknown estimates deliberately prefer spillable SMJ. */
+        public boolean fitsHashJoin(long maxBuildRows, long maxBytesPerWorker) {
+            if (Double.isFinite(rows) == false || Double.isFinite(bytesPerWorker) == false) {
+                return false;
+            }
+            boolean rowsFit = maxBuildRows < 0 || rows < maxBuildRows;
+            boolean bytesFit = maxBytesPerWorker <= 0 || bytesPerWorker <= maxBytesPerWorker;
+            return rowsFit && bytesFit;
+        }
+    }
+
     private static double averageTypeWidthBytes(RelDataType type) {
         final int bytesPerChar = 2;
         final double variableWidthCap = 100d;

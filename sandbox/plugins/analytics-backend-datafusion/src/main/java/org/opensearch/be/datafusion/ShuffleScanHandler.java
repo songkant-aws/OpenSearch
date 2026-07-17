@@ -20,6 +20,9 @@ import org.opensearch.analytics.spi.ShuffleBufferRegistry;
 import org.opensearch.analytics.spi.ShuffleScanInstructionNode;
 import org.opensearch.be.datafusion.nativelib.NativeBridge;
 
+import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
+
 /**
  * Handler for {@link ShuffleScanInstructionNode} on a hash-shuffle worker.
  *
@@ -54,6 +57,11 @@ import org.opensearch.be.datafusion.nativelib.NativeBridge;
 public class ShuffleScanHandler implements FragmentInstructionHandler<ShuffleScanInstructionNode> {
 
     private static final Logger LOGGER = LogManager.getLogger(ShuffleScanHandler.class);
+    private final Executor drainExecutor;
+
+    ShuffleScanHandler(Executor drainExecutor) {
+        this.drainExecutor = drainExecutor;
+    }
 
     @Override
     public BackendExecutionContext apply(
@@ -232,7 +240,7 @@ public class ShuffleScanHandler implements FragmentInstructionHandler<ShuffleSca
         final byte[] firstChunkFinal = firstChunk;
         final CloseableIterator<byte[]> chunkIter = chunks;
         final DatafusionPartitionSender finalSender = sender;
-        Thread drainThread = new Thread(() -> {
+        Runnable drainTask = () -> {
             int chunkCount = 0;
             Throwable drainFailure = null;
             try {
@@ -277,9 +285,16 @@ public class ShuffleScanHandler implements FragmentInstructionHandler<ShuffleSca
                     LOGGER.warn("ShuffleScanHandler.drain: sender teardown failed for " + inputId, closeErr);
                 }
             }
-        }, "shuffle-drain-" + node.getQueryId() + "-" + node.getTargetStageId() + "-" + side + "-" + node.getShufflePartitionIndex());
-        drainThread.setDaemon(true);
-        drainThread.start();
+        };
+        try {
+            // Use an OpenSearch-managed executor so shutdown, accounting and rejection are
+            // visible to the node lifecycle instead of leaking one daemon thread per side.
+            drainExecutor.execute(drainTask);
+        } catch (RejectedExecutionException e) {
+            chunks.close();
+            sender.fail("shuffle drain executor rejected " + inputId + " (side=" + side + "): " + e);
+            throw new RuntimeException("ShuffleScanHandler: drain executor rejected " + inputId, e);
+        }
 
         return backendContext;
     }

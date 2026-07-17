@@ -22,6 +22,7 @@ import org.opensearch.analytics.spi.ShardScanWithDelegationInstructionNode;
 import org.opensearch.analytics.spi.ShuffleProducerInstructionNode;
 import org.opensearch.analytics.spi.ShuffleScanInstructionNode;
 import org.opensearch.analytics.spi.ShuffleWorkerSetupInstructionNode;
+import org.opensearch.threadpool.ThreadPool;
 
 import java.util.List;
 import java.util.Optional;
@@ -133,7 +134,7 @@ public class DataFusionInstructionHandlerFactory implements FragmentInstructionH
             return new BroadcastInjectionHandler();
         }
         if (node instanceof ShuffleScanInstructionNode) {
-            return new ShuffleScanHandler();
+            return new ShuffleScanHandler(plugin.getThreadPool().executor(ThreadPool.Names.GENERIC));
         }
         if (node instanceof ShuffleProducerInstructionNode) {
             return new ShuffleProducerHandler();

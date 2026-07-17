@@ -417,11 +417,11 @@ public class DefaultPlanExecutor extends HandledTransportAction<AnalyticsQueryRe
         // hash-shuffle / coordinator-centric (the build overflowed the runtime cap on attempt 1).
         plannerContext.setBroadcastEligible(!broadcastDisabled);
         RelNode plan = PlannerImpl.createPlan(logicalFragment, plannerContext);
-        // General post-CBO distribution-enforcement pass (Option B — the only MPP scheduler). Volcano CBO
-        // gathers every join to COORDINATOR+SINGLETON (its cost gate knows only 3 fixed localities), so its
-        // output is the degenerate "gather everything" plan. This pass walks that plan and places exchanges
-        // by the OpenSearchDistribution.satisfies() algebra — the cascade, agg-over-join, outer-join,
-        // mixed-key, broadcast, and scalar-subquery shapes all emerge generically, with no per-shape code.
+        // General post-CBO distribution-enforcement pass (Option B — the only MPP scheduler). Top-down
+        // traits let Volcano choose concrete distributed alternatives for covered shapes; this pass fills
+        // the remaining structural gaps (notably cascades) using OpenSearchDistribution.satisfies(). The
+        // execution enrichment applies the same HJ byte gate to those post-CBO AUTO joins, so the fallback
+        // no longer bypasses CBO's memory-safety decision.
         // UnifiedDispatch then runs whatever it distributes. Below the size floor the pass is a no-op and the
         // query stays coordinator-centric (CBO's cheap choice for small joins). See
         // MPP-GENERAL-SCHEDULING-DESIGN.md.

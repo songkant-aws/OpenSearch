@@ -162,20 +162,18 @@ public class OpenSearchHashJoinSplitRule extends RelOptRule {
         // the columns that really cross the shuffle, not the original index mapping, and bytes are
         // divided across worker partitions before applying the hash-table overhead.
         RelMetadataQuery mq = call.getMetadataQuery();
-        Double buildRowsValue = mq.getRowCount(join.getRight());
-        double buildRows = buildRowsValue == null ? Double.NaN : buildRowsValue;
         // Calcite's RelOptTable API uses a nominal 100-row fallback for unknown statistics. Do not
         // let that fallback pass the HJ memory gate: consult the planner's actual per-index stats
         // source and mark the build unknown when any underlying scan lacks a row count. This keeps
         // coordinator-only plan-shape behavior unchanged while making MPP HJ conservative.
-        if (hasUnknownTableStatistics(join.getRight())) {
-            buildRows = Double.NaN;
-        }
-        Double averageRowSize = mq.getAverageRowSize(join.getRight());
-        double rowWidth = averageRowSize == null || !Double.isFinite(averageRowSize) || averageRowSize <= 0d
-            ? OpenSearchRelMetadataQuery.estimateRowWidthBytes(join.getRight().getRowType())
-            : averageRowSize;
-        double buildBytesPerWorker = Double.isFinite(buildRows) ? buildRows * rowWidth * 1.5d / partitionCount : Double.NaN;
+        OpenSearchRelMetadataQuery.HashBuildEstimate estimate = OpenSearchRelMetadataQuery.estimateHashBuild(
+            mq,
+            join.getRight(),
+            partitionCount,
+            hasUnknownTableStatistics(join.getRight()) == false
+        );
+        double buildRows = estimate.rows();
+        double buildBytesPerWorker = estimate.bytesPerWorker();
         long maxBuildRows = AnalyticsSettings.MPP_WORKER_SORT_MERGE_JOIN_MIN_ROWS.get(context.getSettings());
         long maxBytesPerWorker = AnalyticsSettings.MPP_WORKER_HASH_JOIN_MAX_BYTES.get(context.getSettings()).getBytes();
 

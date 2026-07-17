@@ -955,16 +955,45 @@ public class ShuffleBufferManagerTests extends OpenSearchTestCase {
         try (var it = buffer.streamLeft(1_000)) {
             assertEquals("spill prefix remains first", (byte) 0, it.next()[0]);
             assertEquals(
-                "resident queue is still full until a live chunk is consumed",
-                AdmitResult.REJECT_RETRY,
+                "a live side spills its oldest resident tail instead of rejecting the producer",
+                AdmitResult.ACCEPTED,
                 mgr.tryAdmit("q1", 0, 0, "left", chunk(3, 50))
             );
+            assertTrue("same-side live spill must use disk", mgr.getSpilledTotalBytes() > 0);
             assertEquals((byte) 1, it.next()[0]);
-            assertEquals(AdmitResult.ACCEPTED, mgr.tryAdmit("q1", 0, 0, "left", chunk(3, 50)));
             buffer.senderDone("left");
             assertEquals((byte) 2, it.next()[0]);
             assertEquals((byte) 3, it.next()[0]);
             assertFalse(it.hasNext());
+        }
+        mgr.clearForQuery("q1");
+    }
+
+    /** Both HJ inputs start native drain threads before execution. A blocked probe channel must
+     *  remain spillable even though both sides are already in live-streaming state. */
+    public void testBothLiveSidesCanSpillWithoutRejectingProducer() throws Exception {
+        Path spillDir = createTempDir();
+        ShuffleBufferManager mgr = new ShuffleBufferManager();
+        mgr.setBudgets(100, 100);
+        mgr.setSpillConfig(true, spillDir, 1_000_000);
+        ShuffleBufferManager.ShuffleBuffer buffer = mgr.getOrCreateBuffer("q1", 0, 0);
+        buffer.setExpectedSenders(1, 1);
+
+        mgr.tryAdmit("q1", 0, 0, "left", chunk(0, 50));
+        mgr.tryAdmit("q1", 0, 0, "right", chunk(1, 50));
+        try (var left = buffer.streamLeft(1_000); var right = buffer.streamRight(1_000)) {
+            assertEquals(AdmitResult.ACCEPTED, mgr.tryAdmit("q1", 0, 0, "left", chunk(2, 40)));
+            assertEquals(AdmitResult.ACCEPTED, mgr.tryAdmit("q1", 0, 0, "right", chunk(3, 40)));
+            assertTrue("both live queues should have evicted resident chunks", mgr.getSpilledTotalBytes() > 0);
+
+            buffer.senderDone("left");
+            buffer.senderDone("right");
+            assertEquals((byte) 0, left.next()[0]);
+            assertEquals((byte) 2, left.next()[0]);
+            assertFalse(left.hasNext());
+            assertEquals((byte) 1, right.next()[0]);
+            assertEquals((byte) 3, right.next()[0]);
+            assertFalse(right.hasNext());
         }
         mgr.clearForQuery("q1");
     }

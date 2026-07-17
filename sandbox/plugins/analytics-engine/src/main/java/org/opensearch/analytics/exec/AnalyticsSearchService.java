@@ -546,11 +546,13 @@ public class AnalyticsSearchService implements AutoCloseable {
                     // Free the shuffle buffer this worker task consumed (keyed by the worker's own
                     // stage + partition). The buffer holds the partition's payload as on-heap
                     // byte[]; without this it lives for the JVM's lifetime and accumulates across
-                    // queries → OOM. On a failed attempt retain the buffer: the scheduler may retry
-                    // this worker, and the native SingleReceiverPartition can replay its durable
-                    // prefix. Terminal query cleanup/cancellation clears it after retries are
-                    // exhausted. Guarded for non-shuffle workers (registry null / no such buffer →
-                    // idempotent no-op).
+                    // queries → OOM. On a failed attempt retain the buffer because retry/recovery
+                    // may still need resident or Java-spilled chunks. The native partition stream
+                    // is one-shot by default and does not unconditionally tee every successful
+                    // batch to disk; end-to-end replay therefore remains the producer/block-retry
+                    // protocol's responsibility. Terminal query cleanup/cancellation clears the
+                    // buffer after retries are exhausted. Guarded for non-shuffle workers
+                    // (registry null / no such buffer → idempotent no-op).
                     if (completed && shuffleBufferRegistry != null) {
                         try {
                             shuffleBufferRegistry.removeBuffer(request.getQueryId(), request.getStageId(), request.getPartitionIndex());

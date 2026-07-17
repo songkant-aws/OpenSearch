@@ -207,4 +207,10 @@ public class OpenSearchTableScanRule extends RelOptRule {
             return rowCount;
         }
     }
+
+    /** Whether this rule's table wrapper carries a real index row count rather than Calcite's
+     *  nominal 100-row fallback. Used by post-CBO runtime-enrichment safety gates. */
+    public static boolean hasKnownRowCount(RelOptTable table) {
+        return table instanceof IndexNameTable indexNameTable && indexNameTable.rowCount != PlannerContext.UNKNOWN_ROW_COUNT;
+    }
 }

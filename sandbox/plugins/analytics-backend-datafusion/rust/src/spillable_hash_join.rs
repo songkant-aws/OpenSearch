@@ -193,7 +193,6 @@ impl SpillableHashJoinExec {
             MetricBuilder::new(&metrics).counter("spill_trigger_count", partition);
         let spill_bucket_count =
             MetricBuilder::new(&metrics).gauge("spill_bucket_count", partition);
-        let spill_metrics = SpillMetrics::new(&metrics, partition);
 
         let mut build_stream = original.left().execute(partition, Arc::clone(&context))?;
         let mut build_batches = Vec::new();
@@ -236,12 +235,12 @@ impl SpillableHashJoinExec {
         let runtime = context.runtime_env();
         let build_spill_manager = SpillManager::new(
             Arc::clone(&runtime),
-            spill_metrics.clone(),
+            spill_metrics_for_side(&metrics, partition, "build"),
             original.left().schema(),
         );
         let probe_spill_manager = SpillManager::new(
             Arc::clone(&runtime),
-            spill_metrics,
+            spill_metrics_for_side(&metrics, partition, "probe"),
             original.right().schema(),
         );
 
@@ -348,6 +347,25 @@ impl SpillableHashJoinExec {
         } else {
             Ok(chained)
         }
+    }
+}
+
+/** DataFusion's standard spill metrics, labelled per join side for observability. */
+fn spill_metrics_for_side(
+    metrics: &ExecutionPlanMetricsSet,
+    partition: usize,
+    side: &'static str,
+) -> SpillMetrics {
+    SpillMetrics {
+        spill_file_count: MetricBuilder::new(metrics)
+            .with_new_label("side", side)
+            .spill_count(partition),
+        spilled_bytes: MetricBuilder::new(metrics)
+            .with_new_label("side", side)
+            .spilled_bytes(partition),
+        spilled_rows: MetricBuilder::new(metrics)
+            .with_new_label("side", side)
+            .spilled_rows(partition),
     }
 }
 
@@ -899,6 +917,61 @@ mod tests {
             12210250226015887276u64,
             "Grace repartition must not reuse HashJoinExec seed"
         );
+    }
+
+    #[test]
+    fn grace_seed_redistributes_a_four_way_exchange_partition() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int32, false)]));
+        let source = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from_iter_values(0..4096))],
+        )?;
+
+        // Reproduce one worker's input after a power-of-two (four-way) upstream exchange.
+        // With the old seed reuse, every row here would land in Grace buckets congruent to
+        // this worker and most buckets would remain empty.
+        let exchange_seed = SeededRandomState::with_seed(0);
+        let mut exchange_hashes = vec![0u64; source.num_rows()];
+        datafusion::common::hash_utils::create_hashes(
+            &[Arc::clone(source.column(0))],
+            exchange_seed.random_state(),
+            &mut exchange_hashes,
+        )?;
+        let worker_rows = UInt32Array::from(
+            exchange_hashes
+                .iter()
+                .enumerate()
+                .filter_map(|(row, hash)| (hash % 4 == 0).then_some(row as u32))
+                .collect::<Vec<_>>(),
+        );
+        let worker_batch = RecordBatch::try_new(
+            schema,
+            vec![take(source.column(0).as_ref(), &worker_rows, None)?],
+        )?;
+
+        let metrics = ExecutionPlanMetricsSet::new();
+        let timer = MetricBuilder::new(&metrics).subset_time("test_partition_time", 0);
+        let keys: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>> =
+            vec![Arc::new(Column::new("key", 0))];
+        let mut bucket_rows = [0usize; 16];
+        partition_batch_with_seed(
+            &worker_batch,
+            &keys,
+            bucket_rows.len(),
+            &GRACE_HASH_SEED,
+            &timer,
+            |bucket, batch| {
+                bucket_rows[bucket] += batch.num_rows();
+                Ok(())
+            },
+        )?;
+
+        assert_eq!(bucket_rows.iter().sum::<usize>(), worker_batch.num_rows());
+        assert!(
+            bucket_rows.iter().filter(|rows| **rows > 0).count() >= 12,
+            "independent Grace seed should spread one exchange partition broadly: {bucket_rows:?}"
+        );
+        Ok(())
     }
 
     fn input(

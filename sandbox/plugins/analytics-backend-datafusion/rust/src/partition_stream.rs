@@ -24,12 +24,11 @@
 //!
 //! # Spill-backed replay
 //!
-//! When the DataFusion disk manager is enabled, the first execution forwards
-//! every incoming batch immediately and writes the same batch to a spill file.
-//! Once EOF is reached, later sequential executions replay that completed file.
-//! This keeps first-pass exchange consumption streaming while making the local
-//! shuffle partition durable enough to be re-read by adaptive operators. When
-//! spill is disabled, the historical one-shot behavior is preserved.
+//! Replay is opt-in. A normal exchange partition is one-shot even when the
+//! DataFusion disk manager is enabled, avoiding an unconditional disk tee for
+//! every shuffle batch. Callers that can actually execute an input more than
+//! once construct a replayable partition; its first pass forwards batches while
+//! writing a spill file, and later sequential executions read that file.
 
 use std::fmt;
 use std::pin::Pin;
@@ -226,6 +225,7 @@ pub(crate) struct SingleReceiverPartition {
     schema: SchemaRef,
     receiver: Mutex<Option<PartitionStreamReceiver>>,
     replay: Arc<Mutex<ReplayState>>,
+    replay_enabled: bool,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -240,10 +240,21 @@ enum ReplayState {
 
 impl SingleReceiverPartition {
     pub(crate) fn new(receiver: PartitionStreamReceiver) -> Self {
+        Self::with_replay(receiver, false)
+    }
+
+    /** Explicit replay contract for adaptive callers that may execute this input twice. */
+    #[allow(dead_code)]
+    pub(crate) fn new_replayable(receiver: PartitionStreamReceiver) -> Self {
+        Self::with_replay(receiver, true)
+    }
+
+    fn with_replay(receiver: PartitionStreamReceiver, replay_enabled: bool) -> Self {
         Self {
             schema: Arc::clone(&receiver.schema),
             receiver: Mutex::new(Some(receiver)),
             replay: Arc::new(Mutex::new(ReplayState::Unopened)),
+            replay_enabled,
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -315,7 +326,9 @@ impl PartitionStream for SingleReceiverPartition {
             );
         };
 
-        if ctx.runtime_env().disk_manager.tmp_files_enabled() == false {
+        if self.replay_enabled == false
+            || ctx.runtime_env().disk_manager.tmp_files_enabled() == false
+        {
             *replay = ReplayState::OneShotConsumed;
             return Box::pin(receiver);
         }
@@ -528,9 +541,15 @@ mod tests {
         // Then the stream yields the terminal Err exactly once (not None/clean-EOF).
         let terminal = receiver.next().await.expect("a terminal item, not EOF");
         let err = terminal.expect_err("truncated partition must surface as Err, never clean EOF");
-        assert!(err.to_string().contains("spill read failed"), "error carries the failure reason: {err}");
+        assert!(
+            err.to_string().contains("spill read failed"),
+            "error carries the failure reason: {err}"
+        );
         // Emitted exactly once — the stream is done afterward.
-        assert!(receiver.next().await.is_none(), "stream ends after the terminal error");
+        assert!(
+            receiver.next().await.is_none(),
+            "stream ends after the terminal error"
+        );
     }
 
     #[tokio::test]
@@ -541,12 +560,19 @@ mod tests {
         let (sender, mut receiver) = channel(Arc::clone(&schema));
         let producer_schema = Arc::clone(&schema);
         let producer = tokio::spawn(async move {
-            sender.tx.send(Ok(test_batch(&producer_schema, &[1]))).await.unwrap();
+            sender
+                .tx
+                .send(Ok(test_batch(&producer_schema, &[1])))
+                .await
+                .unwrap();
             drop(sender);
         });
         let batch = receiver.next().await.unwrap().unwrap();
         assert_eq!(batch.num_rows(), 1);
-        assert!(receiver.next().await.is_none(), "clean close is EOF, not Err");
+        assert!(
+            receiver.next().await.is_none(),
+            "clean close is EOF, not Err"
+        );
         producer.await.unwrap();
     }
 
@@ -554,7 +580,7 @@ mod tests {
     async fn single_receiver_partition_replays_after_first_pass() {
         let schema = test_schema();
         let (sender, receiver) = channel(Arc::clone(&schema));
-        let partition = SingleReceiverPartition::new(receiver);
+        let partition = SingleReceiverPartition::new_replayable(receiver);
         assert_eq!(partition.schema(), &schema);
 
         let producer_schema = Arc::clone(&schema);
@@ -588,6 +614,31 @@ mod tests {
                 .value(0),
             42
         );
+        assert!(second.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn normal_partition_does_not_tee_when_disk_is_enabled() {
+        let schema = test_schema();
+        let (sender, receiver) = channel(Arc::clone(&schema));
+        let partition = SingleReceiverPartition::new(receiver);
+        let producer_schema = Arc::clone(&schema);
+        tokio::spawn(async move {
+            sender
+                .tx
+                .send(Ok(test_batch(&producer_schema, &[7])))
+                .await
+                .unwrap();
+        });
+
+        let ctx = Arc::new(TaskContext::default());
+        let mut first = partition.execute(Arc::clone(&ctx));
+        assert_eq!(first.next().await.unwrap().unwrap().num_rows(), 1);
+        assert!(first.next().await.is_none());
+
+        // The default exchange contract is one-shot. Disk availability alone must not create a
+        // replay file; a second execution is empty unless the caller explicitly opted in.
+        let mut second = partition.execute(ctx);
         assert!(second.next().await.is_none());
     }
 }

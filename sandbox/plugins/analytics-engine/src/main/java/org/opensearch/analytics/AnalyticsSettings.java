@@ -181,7 +181,8 @@ public final class AnalyticsSettings {
      * sort-merge physical alternatives; the hash alternative becomes ineligible when the filtered
      * build estimate reaches this value, so the spillable sort-merge implementation wins. The selected
      * algorithm is carried into the worker session's {@code prefer_hash_join}. Joins distributed only
-     * by the post-CBO enforcement pass retain the old scan-row comparison as an {@code AUTO} fallback.
+     * by the post-CBO enforcement pass apply the same row-and-byte estimate in their {@code AUTO}
+     * fallback so cascaded joins cannot bypass this memory gate.
      *
      * <p>Below the threshold the worker keeps the (faster, no-sort) hash join. Only worker joins are
      * affected — shard-scan and coordinator-reduce sessions always prefer hash join. Default

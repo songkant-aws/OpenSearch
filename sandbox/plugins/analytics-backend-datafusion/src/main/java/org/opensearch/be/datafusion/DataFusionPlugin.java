@@ -489,6 +489,7 @@ public class DataFusionPlugin extends Plugin
     private volatile DataFormatRegistry dataFormatRegistry;
     private volatile SimpleExtension.ExtensionCollection substraitExtensions;
     private volatile ClusterService clusterService;
+    private volatile ThreadPool threadPool;
     private volatile DatafusionSettings datafusionSettings;
     // DocumentLookupProvider implementation. Construction deferred until the DataFusion service is live.
     private volatile GetService getService;
@@ -549,6 +550,7 @@ public class DataFusionPlugin extends Plugin
     ) {
         this.dataFormatRegistry = dataFormatRegistry;
         this.clusterService = clusterService;
+        this.threadPool = threadPool;
         Settings settings = environment.settings();
         long memoryPoolLimit = DATAFUSION_MEMORY_POOL_LIMIT.get(settings);
         long spillMemoryLimit = DATAFUSION_SPILL_MEMORY_LIMIT.get(settings);
@@ -768,6 +770,14 @@ public class DataFusionPlugin extends Plugin
 
     ClusterService getClusterService() {
         return clusterService;
+    }
+
+    ThreadPool getThreadPool() {
+        ThreadPool current = threadPool;
+        if (current == null) {
+            throw new IllegalStateException("DataFusion plugin components have not been initialized");
+        }
+        return current;
     }
 
     DatafusionSettings getDatafusionSettings() {

@@ -9,15 +9,19 @@
 package org.opensearch.analytics.exec.join;
 
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.analytics.AnalyticsSettings;
 import org.opensearch.analytics.exec.QueryContext;
 import org.opensearch.analytics.planner.CapabilityRegistry;
+import org.opensearch.analytics.planner.OpenSearchRelMetadataQuery;
 import org.opensearch.analytics.planner.RelNodeUtils;
 import org.opensearch.analytics.planner.dag.Stage;
 import org.opensearch.analytics.planner.dag.StagePlan;
 import org.opensearch.analytics.planner.rel.OpenSearchJoin;
 import org.opensearch.analytics.planner.rel.OpenSearchTableScan;
+import org.opensearch.analytics.planner.rules.OpenSearchTableScanRule;
 import org.opensearch.analytics.spi.DataTransferCapability;
 import org.opensearch.analytics.spi.InstructionNode;
 import org.opensearch.analytics.spi.ShuffleProducerInstructionNode;
@@ -127,15 +131,28 @@ public final class ShuffleEnrichment {
                 "right",
                 capabilityRegistry
             );
-            // CBO-selected implementation wins. AUTO is retained only for joins introduced/distributed
-            // after CBO by DistributionEnforcementPass; those use the old scan-row heuristic as a safe
-            // compatibility fallback until every such shape is represented as a Volcano alternative.
-            long buildRows = subtreeMaxScanRows(level.rightProducer().getFragment());
+            // CBO-selected implementation wins. AUTO is retained for joins distributed by the
+            // post-CBO enforcement pass (notably cascades), but it must use the same rows x
+            // projection-width x hash-overhead / partition byte gate as the Volcano alternatives.
+            // Unknown statistics deliberately select spillable SMJ rather than treating Calcite's
+            // nominal 100-row fallback as a real estimate.
+            RelNode buildSide = level.rightProducer().getFragment();
+            RelMetadataQuery mq = buildSide.getCluster().getMetadataQuery();
+            boolean statisticsKnown = RelNodeUtils.findNodes(buildSide, OpenSearchTableScan.class)
+                .stream()
+                .allMatch(scan -> OpenSearchTableScanRule.hasKnownRowCount(scan.getTable()));
+            OpenSearchRelMetadataQuery.HashBuildEstimate buildEstimate = OpenSearchRelMetadataQuery.estimateHashBuild(
+                mq,
+                buildSide,
+                partitionCount,
+                statisticsKnown
+            );
+            long hashJoinMaxBytes = clusterService.getClusterSettings().get(AnalyticsSettings.MPP_WORKER_HASH_JOIN_MAX_BYTES).getBytes();
             OpenSearchJoin.JoinAlgorithm joinAlgorithm = workerJoinAlgorithm(worker.getFragment());
             boolean preferHashJoin = switch (joinAlgorithm) {
                 case HASH -> true;
                 case SORT_MERGE -> false;
-                case AUTO -> buildRows < sortMergeJoinMinRows;
+                case AUTO -> buildEstimate.fitsHashJoin(sortMergeJoinMinRows, hashJoinMaxBytes);
             };
 
             // The worker consumes its two producers' partitions. enrichWorkerAlternatives prepends a setup
@@ -155,7 +172,7 @@ public final class ShuffleEnrichment {
 
             LOGGER.debug(
                 "[ShuffleEnrichment] level worker={} left={} right={} partitions={} leftSenders={} rightSenders={} "
-                    + "joinAlgorithm={} buildRows={} preferHashJoin={} targets={}",
+                    + "joinAlgorithm={} buildRows={} buildBytesPerWorker={} hashJoinMaxBytes={} preferHashJoin={} targets={}",
                 workerStageId,
                 level.leftProducer().getStageId(),
                 level.rightProducer().getStageId(),
@@ -163,7 +180,9 @@ public final class ShuffleEnrichment {
                 leftExpected,
                 rightExpected,
                 joinAlgorithm,
-                buildRows,
+                buildEstimate.rows(),
+                buildEstimate.bytesPerWorker(),
+                hashJoinMaxBytes,
                 preferHashJoin,
                 targets
             );
@@ -281,26 +300,6 @@ public final class ShuffleEnrichment {
      *  tables under this exact name so the worker plan's NamedScan binds correctly. */
     public static String canonicalInputId(int producerStageId) {
         return "input-" + producerStageId;
-    }
-
-    /**
-     * Largest {@link OpenSearchTableScan} row count in {@code node}'s subtree (0 when no scan / unknown).
-     * Used to estimate a worker join's build-side size for the sort-merge-join decision — mirrors the
-     * estimate {@code DistributionEnforcementPass} uses for the distribute floor.
-     */
-    static long subtreeMaxScanRows(RelNode node) {
-        if (node == null) {
-            return 0L;
-        }
-        RelNode n = RelNodeUtils.unwrapHep(node);
-        if (n instanceof OpenSearchTableScan scan) {
-            return Math.max(0L, (long) scan.getTable().getRowCount());
-        }
-        long max = 0L;
-        for (RelNode input : n.getInputs()) {
-            max = Math.max(max, subtreeMaxScanRows(input));
-        }
-        return max;
     }
 
     static OpenSearchJoin.JoinAlgorithm workerJoinAlgorithm(RelNode node) {
